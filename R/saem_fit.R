@@ -178,6 +178,8 @@
                        etaDistInfo = NULL,
                        nonMuThetaGradEvery = 1L,
                        etaDistStart = NULL,
+                       populationUpdate = "mstep",
+                       scoreSaRidge = 1e-3,
                        stepsizeRw = 0.4,
                        coefSa = 0.95,
                        coefPhi0 = 0.9638,
@@ -935,6 +937,10 @@
     etaDistCorPhi0 = etaDistCorPhi0,
     etaDistMapFn = etaDistMapFn,
     etaDistDebug = as.integer(getOption("nlmixr2.etaDistDebug", 0L)),
+    ## saemControl(populationUpdate="score"); see src/scoreSa.h.
+    scoreSaOn = as.integer(identical(populationUpdate, "score")),
+    scoreSaDebug = as.integer(getOption("nlmixr2.scoreSaDebug", 0L)),
+    scoreSaRidge = as.double(scoreSaRidge),
     ## The declared-distribution M-step must not run before the latent omega is
     ## pinned to its declared unit value: until then saem is still ESTIMATING
     ## that variance, so the latents are not standard normal and the step's

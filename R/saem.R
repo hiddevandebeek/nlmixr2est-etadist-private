@@ -308,6 +308,8 @@
                         iacceptSingle=rxode2::rxGetControl(ui, "iacceptSingle", 0.44),
                         nonMuThetaGradEvery=as.integer(
                           rxode2::rxGetControl(ui, "nonMuThetaGradEvery", 1L)),
+                        populationUpdate=rxode2::rxGetControl(ui, "populationUpdate", "mstep"),
+                        scoreSaRidge=rxode2::rxGetControl(ui, "scoreSaRidge", 1e-3),
                         etaDistInfo={
                           ## Metadata for the declared-distribution M-steps.  Built
                           ## when EITHER the family fit (etaDistMstep) or the copula

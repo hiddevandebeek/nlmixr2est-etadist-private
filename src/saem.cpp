@@ -41,6 +41,7 @@ using namespace Rcpp;
 // likelihood M-step live in their own translation unit so saem and imp share
 // one implementation -- see src/etaDistFam.h.
 #include "etaDistFam.h"
+#include "scoreSa.h"
 
 typedef void (*fn_ptr) (double *, double *);
 
@@ -2719,6 +2720,9 @@ public:
       }
     }
     if (etaDistEvery < 1) etaDistEvery = 1;
+    if (x.containsElementNamed("scoreSaOn")) scoreSaOn = as<int>(x["scoreSaOn"]);
+    if (x.containsElementNamed("scoreSaDebug")) scoreSaDebug = as<int>(x["scoreSaDebug"]);
+    if (x.containsElementNamed("scoreSaRidge")) scoreSaRidge = as<double>(x["scoreSaRidge"]);
     if (x.containsElementNamed("etaDistSdLo")) etaDistSdLo = as<double>(x["etaDistSdLo"]);
     if (x.containsElementNamed("etaDistSdHi")) etaDistSdHi = as<double>(x["etaDistSdHi"]);
     // per fit, not per session: the question this answers is "did THIS fit's
@@ -4132,6 +4136,16 @@ public:
 
       // update parameters
       vec Plambda1, Plambda0;
+      // score-SA evaluates the complete-data score AT theta_k, so theta_k,
+      // Omega_k and the current mu are captured before the exact M-step below
+      // overwrites them.  The step itself runs once Omega is final.
+      vec _scoreSaLambda1Old; mat _scoreSaOmegaOld, _scoreSaMprior, _scoreSaPhi;
+      if (scoreSaOn) {
+        _scoreSaLambda1Old = MCOV1(jcov1);
+        _scoreSaOmegaOld = Gamma2_phi1;
+        _scoreSaMprior = mprior_phi1;
+        _scoreSaPhi = Statphi11 / nmc;   // per-subject draw, averaged over chains
+      }
       // A flat column has had its row and column of IGamma2_phi1 zeroed (it is
       // not part of Omega, so it gets no prior), and that zero propagates into
       // CGamma21 -- whose inverse then fails outright.  It also should: the
@@ -4479,6 +4493,99 @@ public:
       // the SA floor above is per-element, so it can pull a pooled group apart
       // again; restore the constraint after it
       poolOmegaGroups(Gamma2_phi1);
+      // ---- score-SA population update -------------------------------------
+      // Replaces the exact M-step's answer for the mu-referenced thetas and
+      // Omega by one preconditioned step along the complete-data score, from
+      // theta_k rather than from the maximizer.  Everything else -- the MCMC E
+      // step, the gain schedule, the residual step, phi0 -- is untouched, so
+      // the two routes differ only in this rule.  A declined step leaves the
+      // exact M-step's answer standing.
+      if (scoreSaOn && nphi1 > 0 && _scoreSaPhi.n_rows == (unsigned int)N) {
+        // Plambda1[k] IS MCOV1[jcov1[k]], and MCOV1 is (nlambda x nphi1), so
+        // the coordinate k moves the design column jcov1[k] % nlambda of the
+        // phi column jcov1[k] / nlambda.  Reading the map off LCOV1's rows
+        // instead assumes one design column per phi column, which is true only
+        // for an intercept-only mu-reference -- and silently wrong otherwise.
+        unsigned int _nLam = (unsigned int)MCOV1.n_rows;
+        arma::umat _lambdaMap(jcov1.n_elem, 2, arma::fill::zeros);
+        unsigned int _nMap = 0;
+        bool _mapOk = (_nLam > 0);
+        for (unsigned int _k = 0; _k < jcov1.n_elem; ++_k) {
+          unsigned int _lin = (unsigned int)jcov1(_k);
+          unsigned int _row = _lin % _nLam;      // design column of COV1
+          unsigned int _col = _lin / _nLam;      // phi1 column
+          if (_col >= (unsigned int)nphi1 || _row >= (unsigned int)COV1.n_cols) {
+            _mapOk = false; break;
+          }
+          _lambdaMap(_nMap, 0) = _col;
+          _lambdaMap(_nMap, 1) = _row;
+          _nMap++;
+        }
+        if (_mapOk && _nMap == jcov1.n_elem) {
+          arma::vec _lam = _scoreSaLambda1Old;
+          arma::mat _om = _scoreSaOmegaOld;
+          // The step's own gain, NOT pas(kiter).  pas is 1.0 through burn-in,
+          // which is free for an exact maximizer and ruinous for a Newton step
+          // taken against an information estimated from a handful of
+          // iterations: measured, 300 full-gain iterations drove CL to 22.8
+          // against a truth of 3.5, 40 left it at 4.6.  The pre-heating phase
+          // is what lets the information accumulate first.
+          unsigned int _scPre = (unsigned int)std::max(50.0,
+            std::min(2000.0, 0.2 * (double)niter));
+          unsigned int _scHeat = _scPre + (unsigned int)(0.1 * (double)niter);
+          double _scGain = scoreSaGain(kiter, _scPre, 1e-4, 0.8, _scHeat);
+          if (_scGain > pas(kiter)) _scGain = pas(kiter);
+          // Average over the TERMINAL phase only.  Averaging from the first
+          // decaying gain averages the approach, not the estimate: measured,
+          // Omega came back at 0.068/0.134 against a truth of 0.09/0.16 with
+          // starting values of 0.06/0.12 -- i.e. dragged back toward where the
+          // fit began.  saemix starts its average at a convergence criterion
+          // (copulaScoreSa.R:1191); the last quarter of the run is the same
+          // idea with a fixed, reportable boundary.
+          unsigned int _scAvgFrom = (unsigned int)niter -
+            (unsigned int)std::max(50.0, 0.25 * (double)niter);
+          bool _scAvg = (_scGain < 1.0) && (kiter >= _scAvgFrom);
+          if (scoreSaDebug > 0 && (kiter % 100 == 0 || kiter < 3)) {
+            // What the two routes actually see, at the same iteration.
+            arma::rowvec _mPhi = arma::mean(_scoreSaPhi, 0);
+            arma::rowvec _mMu = arma::mean(_scoreSaMprior, 0);
+            RSprintf("[scoreSa it=%d] mean(phi)=", (int)kiter);
+            for (unsigned int _q = 0; _q < _mPhi.n_elem; ++_q) RSprintf("%.5f ", _mPhi(_q));
+            RSprintf("| mean(mprior)=");
+            for (unsigned int _q = 0; _q < _mMu.n_elem; ++_q) RSprintf("%.5f ", _mMu(_q));
+            RSprintf("| GLS Plambda1=");
+            for (unsigned int _q = 0; _q < Plambda1.n_elem; ++_q) RSprintf("%.5f ", Plambda1(_q));
+            RSprintf("| theta_k=");
+            for (unsigned int _q = 0; _q < _lam.n_elem; ++_q) RSprintf("%.5f ", _lam(_q));
+            RSprintf("| gain=%.4g\n", _scGain);
+          }
+          if (scoreSaStep(scoreSa, _scoreSaPhi, _scoreSaMprior, COV1,
+                          _lambdaMap.rows(0, _nMap - 1), covstruct1,
+                          saemFlatPhi1, fixedIx1, _scGain, scoreSaRidge,
+                          _scAvg, _lam, _om)) {
+            // The LAST iteration reports the Polyak average rather than the
+            // final iterate; see scoreSa.h.
+            if (kiter + 1 >= (unsigned int)niter)
+              scoreSaReportAverage(scoreSa, covstruct1, saemFlatPhi1, _lam, _om);
+            Plambda1 = _lam;
+            if (fixedIx1.n_elem > 0) Plambda1(fixedIx1) = MCOV1(jcov1(fixedIx1));
+            MCOV1(jcov1) = Plambda1;
+            Gamma2_phi1 = _om % covstruct1;
+            poolOmegaGroups(Gamma2_phi1);
+            // CLOSE THE LOOP.  mprior_phi1 = COV1*MCOV1 is computed EARLIER in
+            // this iteration, from the GLS answer, so without this the sampler
+            // keeps drawing phi around the M-step's mean while the score
+            // iterate drifts untested and is merely reported at the end.
+            // Measured: mean(mprior) tracked the GLS (3.0265/1.2784) while the
+            // score iterate sat at 2.9473/1.1951, a 10% gap in V and CL that no
+            // amount of averaging could close because the recursion was never
+            // actually driving the fit.  Gamma2_phi1 needs no such refresh --
+            // IGamma2_phi1 is rebuilt from it at the top of the next iteration.
+            mprior_phi1 = COV1 * MCOV1;
+          }
+        }
+      }
+      // ---------------------------------------------------------------------
       // Split-ETA components sharing an omegaShare group are pooled into a single BSV term
       // (law of total variance) for *reporting only*, into Gamma2_phi1Report; the live
       // Gamma2_phi1 feeding IGamma2_phi1/D1Gamma21 stays untouched so tcl1/tcl2 stay uncoupled.
@@ -5515,6 +5622,13 @@ private:
   // 7.389 to 3.696, and ten iterations later it was 0.0885 with the mapped etas
   // averaging 176 -- each widening feeding the next.
   double etaDistSdLo = 0.5, etaDistSdHi = 1.0;
+  // saemControl(populationUpdate="score"): replace the exact Gaussian M-step
+  // for the mu-referenced thetas and Omega by one preconditioned step along
+  // the complete-data score.  See scoreSa.h.
+  int scoreSaOn = 0;
+  int scoreSaDebug = 0;
+  double scoreSaRidge = 1e-3;
+  scoreSaState scoreSa;
   int etaDistNdist = 0;          // number of declared random effects
   ivec etaDistLatent;            // phi column of each one's OWN latent normal
   ivec etaDistFam;               // family code (rxEtaDistQ/rxEtaDistLogD)

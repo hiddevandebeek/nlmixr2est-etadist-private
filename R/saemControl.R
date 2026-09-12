@@ -200,6 +200,20 @@
 #'   settles near 0.85, where the step recovers a mean of 4.8 against a
 #'   simulation truth of 5.03 -- the ordinary route lands at 6.4 to 7.5.
 #'
+#' @param populationUpdate How the population parameters -- the mu-referenced
+#'   thetas and Omega -- are moved each iteration.  `"mstep"` (the default) is
+#'   ordinary SAEM: smooth the sufficient statistics, then maximize.  `"score"`
+#'   takes one preconditioned step along the complete-data score instead
+#'   (Delyon, Lavielle and Moulines section 8.2, equation 74), with the Fisher
+#'   information accumulated along the recursion after Delattre and Kuhn.
+#'
+#'   For a Gaussian population block the M-step is exact and this cannot beat
+#'   it; the option exists to measure the two, and because the score step
+#'   generalizes to population models whose M-step is not closed-form.
+#'
+#' @param scoreSaRidge Relative ridge on the score-SA information matrix
+#'   (default 1e-3), floored at 1e-10 absolute.
+#'
 #' @param etaDistCorMstep Update a `dist()`-declared Gaussian copula's
 #'   correlation from its closed form -- the sample correlation of the latent
 #'   pair -- instead of leaving it to the general non-mu theta refinement.  On
@@ -731,6 +745,8 @@ saemControl <- function(seed = 99,
                         iacceptSingle = 0.44,
                         nu1B = 0L,
                         nb1B = 10L,
+                        populationUpdate = c("mstep", "score"),
+                        scoreSaRidge = 1e-3,
                         etaDistMstep = FALSE,
                         etaDistStart = NULL,
                         etaDistEvery = 1L,
@@ -989,6 +1005,8 @@ saemControl <- function(seed = 99,
     iacceptSingle = iacceptSingle,
     nu1B = as.integer(nu1B),
     nb1B = as.integer(nb1B),
+    populationUpdate = match.arg(populationUpdate),
+    scoreSaRidge = as.double(scoreSaRidge),
     etaDistMstep = etaDistMstep,
     etaDistStart = if (is.null(etaDistStart)) NULL else as.integer(etaDistStart),
     etaDistEvery = as.integer(etaDistEvery),
