@@ -63,6 +63,61 @@ static inline void gEtaDistUnpack(const double *p, double *a) {
   }
 }
 
+// ---- DEFECT 1 FIX: the copula term the margin objective was missing -------
+//
+// The population density is p(eta | a, R) = c_R(xi) * prod_j f_j(eta_j; a_j)
+// with xi_j = Phi^-1{F_j(eta_j; a_j)}, so
+//
+//   d/da_j log p = d/da_j log f_j  +  d/da_j log c_R
+//
+// and the second term is NOT zero: a_j moves the copula argument.  Maximizing
+// the marginal density alone is IFM / two-stage estimation -- consistent for
+// observed data, not for POSTERIOR draws, because the dropped term does not
+// average away.  Its fixed point solves E[grad log f] = 0 rather than
+// E[grad log p] = 0; the two coincide only at R = I.
+//
+// For a pair with correlation rho, holding the partner's xi fixed:
+//
+//   log c = -1/2 log(1-rho^2)
+//           - [ rho^2 (xi_j^2 + xi_k^2) - 2 rho xi_j xi_k ] / (2(1-rho^2))
+//
+// Set by rxEtaDistSetCopula() before the fit; cleared after, so a margin with
+// no partner keeps exactly the old objective.
+// The CDF, mirroring rxEtaDistQ()'s dispatch.  Local to this file on purpose:
+// adding it to etaDistFam.h would change the header and force every object to
+// rebuild, and only this objective needs it.
+static double etaDistCdfLocal(int fam, double x, const double *a) {
+  switch (fam) {
+  case RXETADIST_NORM:       return R::pnorm(x, a[0], a[1], 1, 0);
+  case RXETADIST_STDNORMAL:  return R::pnorm(x, 0.0, 1.0, 1, 0);
+  case RXETADIST_STUDENTT:   return R::pt((x - a[1])/a[2], a[0], 1, 0);
+  case RXETADIST_CAUCHY:     return R::pcauchy(x, a[0], a[1], 1, 0);
+  case RXETADIST_LOGIS:      return R::plogis(x, a[0], a[1], 1, 0);
+  case RXETADIST_LNORM:      return R::plnorm(x, a[0], a[1], 1, 0);
+  case RXETADIST_CHISQ:      return R::pchisq(x, a[0], 1, 0);
+  case RXETADIST_EXP:        return R::pexp(x, 1.0/a[0], 1, 0);
+  case RXETADIST_GAMMA:      return R::pgamma(x, a[0], 1.0/a[1], 1, 0);
+  case RXETADIST_WEIBULL:    return R::pweibull(x, a[0], a[1], 1, 0);
+  case RXETADIST_BETA:       return R::pbeta(x, a[0], a[1], 1, 0);
+  case RXETADIST_BETAPROP:   return R::pbeta(x, a[0]*a[1], (1.0 - a[0])*a[1], 1, 0);
+  case RXETADIST_UNIF:       return R::punif(x, a[0], a[1], 1, 0);
+  default:                   return NA_REAL;   // copula term declines
+  }
+}
+
+static std::vector<double> gEtaDistXiPartner;
+static double gEtaDistRho = 0.0;
+static bool gEtaDistCopulaOn = false;
+
+void rxEtaDistSetCopula(const std::vector<double> &xiPartner, double rho) {
+  gEtaDistXiPartner = xiPartner; gEtaDistRho = rho;
+  gEtaDistCopulaOn = !xiPartner.empty() && std::isfinite(rho) &&
+    std::fabs(rho) < 0.999;
+}
+void rxEtaDistClearCopula() {
+  gEtaDistXiPartner.clear(); gEtaDistRho = 0.0; gEtaDistCopulaOn = false;
+}
+
 static double gEtaDistObj(const double *p) {
   double a[4];
   gEtaDistUnpack(p, a);
@@ -76,6 +131,19 @@ static double gEtaDistObj(const double *p) {
     double l = rxEtaDistLogD(gEtaDistFam, gEtaDistVals[i], a);
     if (!std::isfinite(l)) return 1e300;
     nll -= wi*l;
+    if (gEtaDistCopulaOn && i < gEtaDistXiPartner.size()) {
+      double u = etaDistCdfLocal(gEtaDistFam, gEtaDistVals[i], a);
+      if (!std::isfinite(u)) return 1e300;
+      if (u < 1e-15) u = 1e-15; else if (u > 1.0 - 1e-15) u = 1.0 - 1e-15;
+      double xj = R::qnorm(u, 0.0, 1.0, 1, 0);
+      double xk = gEtaDistXiPartner[i];
+      if (!std::isfinite(xj) || !std::isfinite(xk)) return 1e300;
+      double r = gEtaDistRho, det = 1.0 - r*r;
+      double lc = -0.5*std::log(det) -
+        (r*r*(xj*xj + xk*xk) - 2.0*r*xj*xk) / (2.0*det);
+      if (!std::isfinite(lc)) return 1e300;
+      nll -= wi*lc;
+    }
   }
   return std::isfinite(nll) ? nll : 1e300;
 }
@@ -515,9 +583,52 @@ double rxEtaDistCorMleW(const std::vector<double> &z1,
     s11 += wi*d1*d1; s22 += wi*d2*d2; s12 += wi*d1*d2;
   }
   if (!(s11 > 0.0) || !(s22 > 0.0)) return NA_REAL;
-  double r = s12 / std::sqrt(s11*s22);
-  if (!std::isfinite(r)) return NA_REAL;
-  return std::max(std::min(r, 0.999), -0.999);
+  // DEFECT 2 FIX.  The sample correlation is not the constrained maximizer of
+  //
+  //   l(R) = -(n/2) [ log|R| + tr(R^-1 S) ]
+  //
+  // over correlation matrices.  Unconstrained the maximizer is S; with the
+  // diagonal held at one the stationarity condition for a pair is the cubic
+  //
+  //   rho^3 - s12 rho^2 + (s11 + s22 - 1) rho - s12 = 0,
+  //
+  // which factors as (rho - s12)(rho^2 + 1) only when s11 = s22 = 1 -- i.e.
+  // the old rule is right exactly at unit spread and nowhere else.  The cubic
+  // also carries the log|R| term the moment rule has no counterpart for, which
+  // is what keeps the estimate off the boundary instead of letting it feed
+  // back into the draws it was computed from.
+  //
+  // The model says the latent has mean ZERO, so the sufficient statistic is
+  // the UNCENTRED second moment; centring discards information.
+  double m11 = s11/sw + m1*m1, m22 = s22/sw + m2*m2, m12 = s12/sw + m1*m2;
+  double best = NA_REAL, bestValue = -1e300;
+  // Cardano on rho^3 + b rho^2 + c rho + d with b=-m12, c=m11+m22-1, d=-m12.
+  double b = -m12, c = m11 + m22 - 1.0, d = -m12;
+  double p = c - b*b/3.0, q = 2.0*b*b*b/27.0 - b*c/3.0 + d;
+  double disc = q*q/4.0 + p*p*p/27.0;
+  double roots[3]; int nroot = 0;
+  if (disc > 0) {
+    double sq = std::sqrt(disc);
+    roots[nroot++] = std::cbrt(-q/2.0 + sq) + std::cbrt(-q/2.0 - sq) - b/3.0;
+  } else {
+    double rr = std::sqrt(-p*p*p/27.0);
+    double phi = std::acos(std::max(-1.0, std::min(1.0, -q/(2.0*rr))));
+    double t = 2.0*std::cbrt(rr);
+    for (int k = 0; k < 3; ++k)
+      roots[nroot++] = t*std::cos((phi + 2.0*M_PI*k)/3.0) - b/3.0;
+  }
+  for (int k = 0; k < nroot; ++k) {
+    double rho = roots[k];
+    if (!std::isfinite(rho) || std::fabs(rho) >= 0.999) continue;
+    double det = 1.0 - rho*rho;
+    double value = -0.5*(std::log(det) + (m11 - 2.0*rho*m12 + m22)/det);
+    if (value > bestValue) { bestValue = value; best = rho; }
+  }
+  if (!std::isfinite(best)) {           // no admissible root: keep the old rule
+    best = s12 / std::sqrt(s11*s22);
+    if (!std::isfinite(best)) return NA_REAL;
+  }
+  return std::max(std::min(best, 0.999), -0.999);
 }
 
 double rxEtaDistCorMle(const std::vector<double> &z1,

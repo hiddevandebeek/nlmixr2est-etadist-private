@@ -935,6 +935,13 @@
     etaDistCorPhi0 = etaDistCorPhi0,
     etaDistMapFn = etaDistMapFn,
     etaDistDebug = as.integer(getOption("nlmixr2.etaDistDebug", 0L)),
+    ## NOT in the upstream branch.  src/saem.cpp reads etaDistSdLo/etaDistSdHi
+    ## from this list, but nothing on the R side ever supplies them, so the
+    ## pooled-spread guard is fixed at the C++ defaults [0.5, 1.0] and no user
+    ## can widen it.  Exposed here ONLY so the rule can be tested with a guard
+    ## that admits the step -- a fit run this way is NOT the shipped behaviour.
+    etaDistSdLo = as.double(getOption("nlmixr2.etaDistSdLo", 0.5)),
+    etaDistSdHi = as.double(getOption("nlmixr2.etaDistSdHi", 1.0)),
     ## The declared-distribution M-step must not run before the latent omega is
     ## pinned to its declared unit value: until then saem is still ESTIMATING
     ## that variance, so the latents are not standard normal and the step's

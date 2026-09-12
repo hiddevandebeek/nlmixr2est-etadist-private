@@ -41,6 +41,10 @@ using namespace Rcpp;
 // likelihood M-step live in their own translation unit so saem and imp share
 // one implementation -- see src/etaDistFam.h.
 #include "etaDistFam.h"
+// Defined in etaDistFam.cpp.  Declared here rather than in etaDistFam.h so the
+// header is untouched and only these two objects rebuild.
+void rxEtaDistSetCopula(const std::vector<double> &xiPartner, double rho);
+void rxEtaDistClearCopula();
 
 typedef void (*fn_ptr) (double *, double *);
 
@@ -5967,7 +5971,30 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
       bool spreadOk = rxEtaDistSpreadOk(w[(size_t)k], etaDistSdLo, etaDistSdHi, &lsd);
       double aNew[4];
       for (int i = 0; i < na; ++i) aNew[i] = a0[i];
+      // DEFECT 1 FIX.  Give the margin fit the partner's latent and the current
+      // correlation, so its objective is the COMPLETE population density rather
+      // than the marginal alone.  A margin with no copula partner gets an empty
+      // vector and the objective is unchanged.
+      {
+        int jPart = etaDistCorWith(k);
+        std::vector<double> xiPartner;
+        double rhoUse = 0.0;
+        if (jPart >= 0 && (size_t)jPart < w.size()) {
+          rhoUse = etaDistRho(k);
+          if (!std::isfinite(rhoUse)) rhoUse = 0.0;
+          // the partner's latent IS its xi: standard normal by construction
+          xiPartner.reserve(ev.size());
+          for (size_t r = 0; r < w[(size_t)k].size() && xiPartner.size() < ev.size(); ++r) {
+            double u = R::pnorm(w[(size_t)k][r], 0.0, 1.0, 1, 0);
+            if (u < 1e-15) u = 1e-15; else if (u > 1.0 - 1e-15) u = 1.0 - 1e-15;
+            if (std::isfinite(rxEtaDistQ(fam, u, a0)))
+              xiPartner.push_back(w[(size_t)jPart][r]);
+          }
+        }
+        rxEtaDistSetCopula(xiPartner, rhoUse);
+      }
       bool mleOk = spreadOk && rxEtaDistMle(fam, ev, aNew);
+      rxEtaDistClearCopula();
       if (etaDistDebug && (kiter % 10 == 0 || kiter < 2)) {
         double ws = 0, ws2 = 0, es = 0, es2 = 0;
         size_t nw = w[(size_t)k].size();
