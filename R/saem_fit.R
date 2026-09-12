@@ -940,6 +940,13 @@
     ## saemControl(populationUpdate="score"); see src/scoreSa.h.
     scoreSaOn = as.integer(identical(populationUpdate, "score")),
     scoreSaDebug = as.integer(getOption("nlmixr2.scoreSaDebug", 0L)),
+    ## src/saem.cpp reads these but upstream never supplies them, so the
+    ## pooled-spread guard is fixed at [0.5, 1.0].  Exposed so BOTH the M-step
+    ## and the score arm can be run under the same widened window -- holding the
+    ## guard equal is what makes the two rules comparable.
+    etaDistPreheat = as.integer(getOption("nlmixr2.etaDistPreheat", 0L)),
+    etaDistSdLo = as.double(getOption("nlmixr2.etaDistSdLo", 0.5)),
+    etaDistSdHi = as.double(getOption("nlmixr2.etaDistSdHi", 1.0)),
     scoreSaRidge = as.double(scoreSaRidge),
     ## The declared-distribution M-step must not run before the latent omega is
     ## pinned to its declared unit value: until then saem is still ESTIMATING

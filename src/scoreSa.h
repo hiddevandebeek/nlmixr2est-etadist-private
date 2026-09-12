@@ -85,6 +85,16 @@ struct scoreSaState {
   arma::vec average;
   unsigned int averageCount = 0;
   bool averaging = false;
+  // Expanding truncation sets, Fort, Moulines, Schreck and Vihola (2016).
+  // Projected stochastic approximation converges to a boundary point of the
+  // projected ODE, which is NOT a stationary point of the likelihood, so a
+  // FIXED box is not safe.  Each hit doubles the half-width and returns the
+  // iterate to the centre; under the coercivity the convergence argument
+  // already assumes, the boundary is hit finitely often almost surely.
+  arma::vec centre;
+  arma::vec width;
+  unsigned int expansions = 0;
+  unsigned int backtracks = 0;
 };
 
 static inline void scoreSaOmegaIndex(const arma::mat &covstruct1,
@@ -197,6 +207,7 @@ static inline bool scoreSaStep(scoreSaState &state,
                                const arma::uvec &flatPhi1,
                                const arma::uvec &fixedIx1,
                                double gain, double ridge, bool averagePhase,
+                               double boxWidth,
                                arma::vec &Plambda1, arma::mat &Gamma2) {
   unsigned int N = phi1.n_rows;
   if (N < 2 || !phi1.is_finite() || !mprior.is_finite()) return false;
@@ -255,6 +266,28 @@ static inline bool scoreSaStep(scoreSaState &state,
   }
   arma::vec proposal = current + gain * direction;
   if (!proposal.is_finite()) return false;
+  // Truncation box.  Half-width `boxWidth` around the starting point, doubling
+  // and re-initialising on every hit.
+  if (state.centre.n_elem != p) {
+    state.centre = current;
+    state.width = arma::vec(p, arma::fill::value(boxWidth));
+    state.expansions = 0;
+  }
+  {
+    arma::vec lower = state.centre - state.width;
+    arma::vec upper = state.centre + state.width;
+    arma::vec projected = arma::min(upper, arma::max(lower, proposal));
+    if (arma::any(arma::abs(projected - proposal) > 0)) {
+      state.width *= 2.0;
+      state.expansions++;
+      // re-initialise, as Algorithm 2 of Fort et al. requires
+      proposal = state.centre;
+      state.deltaSubject.reset();
+      state.average.reset(); state.averageCount = 0; state.averaging = false;
+    } else {
+      proposal = projected;
+    }
+  }
   // A theta the model fixes takes no step.
   for (unsigned int f = 0; f < fixedIx1.n_elem; ++f)
     if (fixedIx1(f) < nBeta) proposal(fixedIx1(f)) = current(fixedIx1(f));
@@ -297,6 +330,189 @@ static inline bool scoreSaStep(scoreSaState &state,
       state.average += (proposal - state.average) / (double)state.averageCount;
     }
   }
+  state.iteration++;
+  return true;
+}
+
+
+// ===========================================================================
+// DECLARED-FAMILY BLOCK: the score for dist()-declared margins under a
+// Gaussian copula, in ETA space.
+//
+// This is the case with no closed-form M-step, and the reason the score route
+// is worth having.  After rxEtaDistExpand() the family parameters sit in the
+// DATA likelihood, so their score there would need differentiating through the
+// ODE solve.  In eta space they are prior-only again:
+//
+//   log p(eta; a, R) = log c_R(xi) + sum_j log f_j(eta_j; a_j),
+//   xi_j = Phi^-1{F_j(eta_j; a_j)}
+//
+//   d/da_j log p = d/da_j log f_j  +  [-(R^-1 - I) xi]_j * dxi_j/da_j
+//   dxi_j/da_j   = (dF_j/da_j) / phi(xi_j)
+//
+// The second term is the one a marginal-only M-step cannot see.  Verified
+// against finite differences of the complete-data log density to 2.4e-9 on two
+// correlated gammas (analysis/gammaEtaScore.R).
+//
+// dF/da has no elementary closed form for a Gamma's shape, so it is taken by
+// central difference -- a scalar per draw, negligible against the solve.
+
+// CDF, mirroring rxEtaDistQ()'s dispatch.  Local to this header on purpose.
+static inline double scoreSaCdf(int fam, double x, const double *a) {
+  switch (fam) {
+  case RXETADIST_NORM:      return R::pnorm(x, a[0], a[1], 1, 0);
+  case RXETADIST_STDNORMAL: return R::pnorm(x, 0.0, 1.0, 1, 0);
+  case RXETADIST_CAUCHY:    return R::pcauchy(x, a[0], a[1], 1, 0);
+  case RXETADIST_LOGIS:     return R::plogis(x, a[0], a[1], 1, 0);
+  case RXETADIST_LNORM:     return R::plnorm(x, a[0], a[1], 1, 0);
+  case RXETADIST_CHISQ:     return R::pchisq(x, a[0], 1, 0);
+  case RXETADIST_EXP:       return R::pexp(x, 1.0/a[0], 1, 0);
+  case RXETADIST_GAMMA:     return R::pgamma(x, a[0], 1.0/a[1], 1, 0);
+  case RXETADIST_WEIBULL:   return R::pweibull(x, a[0], a[1], 1, 0);
+  case RXETADIST_BETA:      return R::pbeta(x, a[0], a[1], 1, 0);
+  case RXETADIST_UNIF:      return R::punif(x, a[0], a[1], 1, 0);
+  default:                  return NA_REAL;
+  }
+}
+
+// Exact d(logD)/d(native parameter), defined in etaDistFam.cpp.  Declared here
+// rather than in etaDistFam.h so the header is untouched.
+bool rxEtaDistGradD(int fam, double x, const double *a, double *ll, double *g);
+
+// d(log f)/da EXACTLY where rxode2ll provides it, dF/da by central difference.  Using the same
+// scheme for each keeps the two consistent to the same order, which matters
+// because they are added.
+static inline void scoreSaFamilyGrad(int fam, double x, const double *a,
+                                     int na, double *dLogf, double *dCdf) {
+  // The analytic path halves the work and is exact; only the CDF derivative
+  // genuinely needs differencing (the incomplete gamma has no elementary
+  // derivative in its shape).
+  double ll = 0.0;
+  bool exact = rxEtaDistGradD(fam, x, a, &ll, dLogf);
+  for (int j = 0; j < na; ++j) {
+    double h = 1e-6 * std::max(1.0, std::fabs(a[j]));
+    double ap[4], am[4];
+    for (int i = 0; i < na; ++i) { ap[i] = a[i]; am[i] = a[i]; }
+    ap[j] += h; am[j] -= h;
+    if (!exact)
+      dLogf[j] = (rxEtaDistLogD(fam, x, ap) - rxEtaDistLogD(fam, x, am)) / (2*h);
+    dCdf[j] = (scoreSaCdf(fam, x, ap) - scoreSaCdf(fam, x, am)) / (2*h);
+  }
+}
+
+// One preconditioned score step for a declared PAIR (family parameters of both
+// margins plus the correlation, in the atanh coordinate the expansion carries).
+// Returns false to decline, leaving the caller's parameters untouched.
+static inline bool scoreSaEtaDistStep(scoreSaState &state,
+                                      const std::vector<double> &eta0,
+                                      const std::vector<double> &eta1,
+                                      int fam0, int fam1,
+                                      double *a0, double *a1, double &rho,
+                                      double gain, double ridge,
+                                      bool averagePhase, double boxWidth) {
+  int na0 = rxEtaDistNarg(fam0), na1 = rxEtaDistNarg(fam1);
+  if (na0 <= 0 || na1 <= 0) return false;
+  size_t n = std::min(eta0.size(), eta1.size());
+  if (n < 10) return false;
+  if (!std::isfinite(rho) || std::fabs(rho) >= 0.999) return false;
+  unsigned int p = (unsigned int)(na0 + na1 + 1);
+  double det = 1.0 - rho*rho;
+  // excess = R^-1 - I for a pair
+  double e00 = rho*rho/det, e01 = -rho/det, e11 = rho*rho/det;
+  arma::mat scores((unsigned int)n, p, arma::fill::zeros);
+  double dLogf[4], dCdf[4];
+  for (size_t i = 0; i < n; ++i) {
+    double u0 = scoreSaCdf(fam0, eta0[i], a0);
+    double u1 = scoreSaCdf(fam1, eta1[i], a1);
+    if (!std::isfinite(u0) || !std::isfinite(u1)) return false;
+    u0 = std::min(std::max(u0, 1e-15), 1.0 - 1e-15);
+    u1 = std::min(std::max(u1, 1e-15), 1.0 - 1e-15);
+    double x0 = R::qnorm(u0, 0.0, 1.0, 1, 0), x1 = R::qnorm(u1, 0.0, 1.0, 1, 0);
+    if (!std::isfinite(x0) || !std::isfinite(x1)) return false;
+    // influence = -(R^-1 - I) xi
+    double inf0 = -(e00*x0 + e01*x1), inf1 = -(e01*x0 + e11*x1);
+    double d0 = R::dnorm(x0, 0.0, 1.0, 0), d1 = R::dnorm(x1, 0.0, 1.0, 0);
+    if (!(d0 > 0) || !(d1 > 0)) return false;
+    // Scores are formed in the SAME coordinates the step is taken in -- log
+    // for a positive parameter, atanh for rho.  Forming them natively and
+    // rescaling the DIRECTION afterwards is wrong: the information is then
+    // native while the step is not, and the correct log step A^-1 I^-1 s comes
+    // out as A I^-1 s -- an error of a^2, which for a shape of 8 is a step 64
+    // times too long.  Measured before this fix: the recursion drove a shape
+    // of truth 6 to 147.
+    int m0 = rxEtaDistPosMask(fam0), m1 = rxEtaDistPosMask(fam1);
+    scoreSaFamilyGrad(fam0, eta0[i], a0, na0, dLogf, dCdf);
+    for (int j = 0; j < na0; ++j) {
+      double v = dLogf[j] + inf0 * dCdf[j] / d0;
+      scores(i, j) = (m0 & (1 << j)) ? v * a0[j] : v;
+    }
+    scoreSaFamilyGrad(fam1, eta1[i], a1, na1, dLogf, dCdf);
+    for (int j = 0; j < na1; ++j) {
+      double v = dLogf[j] + inf1 * dCdf[j] / d1;
+      scores(i, na0 + j) = (m1 & (1 << j)) ? v * a1[j] : v;
+    }
+    // d/drho of log c, then chain rule to atanh(rho)
+    double dLogDet = -2.0*rho/det;
+    double q = (x0*x0 + x1*x1)*(2.0*rho*det + 2.0*rho*rho*rho)/(det*det)
+      - 2.0*x0*x1*(det + 2.0*rho*rho)/(det*det);
+    scores(i, p - 1) = -0.5*(dLogDet + q) * det;
+  }
+  if (!scores.is_finite()) return false;
+  arma::vec meanScore = arma::mean(scores, 0).t();
+  if (state.deltaSubject.n_rows != (unsigned int)n ||
+      state.deltaSubject.n_cols != p) state.deltaSubject = scores;
+  else state.deltaSubject = (1.0 - gain)*state.deltaSubject + gain*scores;
+  arma::mat information = state.deltaSubject.t()*state.deltaSubject/(double)n;
+  information = 0.5*(information + information.t());
+  information.diag() += std::max(1e-10,
+    ridge*arma::trace(information)/(double)p);
+  arma::mat inverse;
+  if (arma::inv_sympd(inverse, information)) {
+    state.inverseInformation = inverse; state.ready = true;
+  } else if (state.inverseInformation.n_rows != p) {
+    state.inverseInformation = arma::eye(p, p);
+  }
+  arma::vec direction = state.inverseInformation * meanScore;
+  if (!direction.is_finite()) return false;
+  // unconstrained coordinates: log for a positive parameter, atanh for rho
+  arma::vec current(p);
+  int mask0 = rxEtaDistPosMask(fam0), mask1 = rxEtaDistPosMask(fam1);
+  for (int j = 0; j < na0; ++j)
+    current(j) = (mask0 & (1 << j)) ? std::log(a0[j]) : a0[j];
+  for (int j = 0; j < na1; ++j)
+    current(na0 + j) = (mask1 & (1 << j)) ? std::log(a1[j]) : a1[j];
+  current(p - 1) = std::atanh(rho);
+  if (!current.is_finite()) return false;
+  // direction is already in the unconstrained coordinates: the scores were
+  // formed there, so the information and the step agree.
+  arma::vec proposal = current + gain*direction;
+  if (!proposal.is_finite()) return false;
+  if (state.centre.n_elem != p) {
+    state.centre = current;
+    state.width = arma::vec(p, arma::fill::value(boxWidth));
+  }
+  {
+    arma::vec lo = state.centre - state.width, hi = state.centre + state.width;
+    arma::vec pr = arma::min(hi, arma::max(lo, proposal));
+    if (arma::any(arma::abs(pr - proposal) > 0)) {
+      state.width *= 2.0; state.expansions++;
+      proposal = state.centre; state.deltaSubject.reset();
+      state.average.reset(); state.averageCount = 0; state.averaging = false;
+    } else proposal = pr;
+  }
+  if (averagePhase) {
+    if (!state.averaging || state.average.n_elem != p) {
+      state.average = proposal; state.averageCount = 1; state.averaging = true;
+    } else {
+      state.averageCount++;
+      state.average += (proposal - state.average)/(double)state.averageCount;
+    }
+  }
+  for (int j = 0; j < na0; ++j)
+    a0[j] = (mask0 & (1 << j)) ? std::exp(proposal(j)) : proposal(j);
+  for (int j = 0; j < na1; ++j)
+    a1[j] = (mask1 & (1 << j)) ? std::exp(proposal(na0+j)) : proposal(na0+j);
+  rho = std::tanh(proposal(p - 1));
   state.iteration++;
   return true;
 }

@@ -2722,6 +2722,8 @@ public:
     if (etaDistEvery < 1) etaDistEvery = 1;
     if (x.containsElementNamed("scoreSaOn")) scoreSaOn = as<int>(x["scoreSaOn"]);
     if (x.containsElementNamed("scoreSaDebug")) scoreSaDebug = as<int>(x["scoreSaDebug"]);
+    if (x.containsElementNamed("scoreSaBox")) scoreSaBox = as<double>(x["scoreSaBox"]);
+    if (x.containsElementNamed("etaDistPreheat")) etaDistPreheat = as<int>(x["etaDistPreheat"]) != 0;
     if (x.containsElementNamed("scoreSaRidge")) scoreSaRidge = as<double>(x["scoreSaRidge"]);
     if (x.containsElementNamed("etaDistSdLo")) etaDistSdLo = as<double>(x["etaDistSdLo"]);
     if (x.containsElementNamed("etaDistSdHi")) etaDistSdHi = as<double>(x["etaDistSdHi"]);
@@ -4562,7 +4564,7 @@ public:
           if (scoreSaStep(scoreSa, _scoreSaPhi, _scoreSaMprior, COV1,
                           _lambdaMap.rows(0, _nMap - 1), covstruct1,
                           saemFlatPhi1, fixedIx1, _scGain, scoreSaRidge,
-                          _scAvg, _lam, _om)) {
+                          _scAvg, scoreSaBox, _lam, _om)) {
             // The LAST iteration reports the Polyak average rather than the
             // final iterate; see scoreSa.h.
             if (kiter + 1 >= (unsigned int)niter)
@@ -5628,7 +5630,10 @@ private:
   int scoreSaOn = 0;
   int scoreSaDebug = 0;
   double scoreSaRidge = 1e-3;
+  double scoreSaBox = 24.0;
+  bool etaDistPreheat = false;
   scoreSaState scoreSa;
+  scoreSaState scoreSaEtaDist;   // declared-family/copula block
   int etaDistNdist = 0;          // number of declared random effects
   ivec etaDistLatent;            // phi column of each one's OWN latent normal
   ivec etaDistFam;               // family code (rxEtaDistQ/rxEtaDistLogD)
@@ -6028,6 +6033,22 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
   //
   // Returns true when anything moved, in which case the caller maps the new
   // NATIVE parameters back onto the user's thetas.
+  // The pre-heated gain, available to BOTH population rules.
+  //
+  // His M-step damps with pas(kiter), which is 1.0 through burn-in.  The score
+  // step needed its own pre-heated schedule to survive this model class, so
+  // comparing the two while only ONE of them has it credits the schedule to the
+  // rule.  With etaDistPreheat=TRUE both damp identically and the contrast is
+  // the rule alone.
+  double etaDistGain(unsigned int kiter, const vec &pas) const {
+    if (!etaDistPreheat) return pas(kiter);
+    unsigned int pre = (unsigned int)std::max(50.0,
+      std::min(2000.0, 0.2 * (double)niter));
+    unsigned int heat = pre + (unsigned int)(0.1 * (double)niter);
+    double g = scoreSaGain(kiter, pre, 1e-4, 0.8, heat);
+    return (g > pas(kiter)) ? pas(kiter) : g;
+  }
+
   bool etaDistMstep(unsigned int kiter, const vec &pas) {
     if ((!etaDistOn && !etaDistCorOn) || etaDistNdist <= 0) return false;
     if (etaDistArgs.n_rows != (unsigned int)etaDistNdist) return false;
@@ -6096,6 +6117,80 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
         if (!spreadOk) RSprintf("[etaDist k=%d it=%d] SKIPPED: latent sd %.4f outside [%.2f, %.2f]\n",
                                 k, (int)kiter, lsd, etaDistSdLo, etaDistSdHi);
       }
+      // PARITY BRANCH.  With populationUpdate="score" the declared families and
+      // their correlation are moved by one preconditioned step along the
+      // complete-data score instead of by the damped argmax.  Same draws, same
+      // gain, same guard -- only the rule differs, which is what makes the two
+      // comparable on one model.
+      // A declared PAIR carries corWith >= 0 on the LATER member only, and the
+      // score step updates BOTH margins of the pair at once.  The earlier
+      // member must therefore be skipped outright: letting it fall through to
+      // the damped argmax below had two different rules updating the same
+      // parameter every iteration, which is not a comparison of either.
+      if (scoreSaOn && etaDistCorWith(k) < 0) {
+        bool isPartner = false;
+        for (int q = 0; q < etaDistNdist; ++q)
+          if (etaDistCorWith(q) == k) { isPartner = true; break; }
+        if (isPartner) continue;      // owned by its partner's score step
+      }
+      if (scoreSaOn && etaDistCorWith(k) >= 0) {
+        int jP = etaDistCorWith(k);
+        int famP = etaDistFam(jP);
+        int naP = rxEtaDistNarg(famP);
+        if (naP > 0 && spreadOk) {
+          // the partner's etas under ITS current parameters
+          double aP[4];
+          for (int i = 0; i < naP; ++i) aP[i] = etaDistArgs(jP, i);
+          std::vector<double> evP; evP.reserve(w[(size_t)jP].size());
+          for (size_t r = 0; r < w[(size_t)jP].size(); ++r) {
+            double uu = R::pnorm(w[(size_t)jP][r], 0.0, 1.0, 1, 0);
+            if (uu < 1e-15) uu = 1e-15; else if (uu > 1.0 - 1e-15) uu = 1.0 - 1e-15;
+            double ee = rxEtaDistQ(famP, uu, aP);
+            if (std::isfinite(ee)) evP.push_back(ee);
+          }
+          // Rebuild BOTH margins' etas under a COMMON mask.  ev and evP are
+          // each filtered for finiteness independently, so a draw dropped from
+          // one and kept in the other silently pairs different subjects -- the
+          // copula term and rho are then computed on mismatched xi, which biases
+          // the step past the optimum and drifts the pooled latent mean.
+          std::vector<double> evA, evB;
+          evA.reserve(w[(size_t)jP].size()); evB.reserve(w[(size_t)k].size());
+          for (size_t r = 0; r < w[(size_t)k].size() &&
+                 r < w[(size_t)jP].size(); ++r) {
+            double uP = R::pnorm(w[(size_t)jP][r], 0.0, 1.0, 1, 0);
+            double uK = R::pnorm(w[(size_t)k][r], 0.0, 1.0, 1, 0);
+            if (uP < 1e-15) uP = 1e-15; else if (uP > 1.0 - 1e-15) uP = 1.0 - 1e-15;
+            if (uK < 1e-15) uK = 1e-15; else if (uK > 1.0 - 1e-15) uK = 1.0 - 1e-15;
+            double eP = rxEtaDistQ(famP, uP, aP);
+            double eK = rxEtaDistQ(fam, uK, a0);
+            if (!std::isfinite(eP) || !std::isfinite(eK)) continue;
+            evA.push_back(eP); evB.push_back(eK);
+          }
+          double rhoUse = etaDistRho(k);
+          double aK[4];
+          for (int i = 0; i < na; ++i) aK[i] = a0[i];
+          // The step's OWN gain, not pas(kiter).  Same lesson as the Gaussian
+          // block: pas is 1.0 through burn-in, and a full Newton step there --
+          // against an information built from a handful of iterations, on a
+          // latent whose spread has not yet settled -- collapses the shape.
+          // Measured before this fix: shape 8 -> 0.435 by iteration 10 and the
+          // implied etas at 9e7 by iteration 40.
+          unsigned int _sePre = (unsigned int)std::max(50.0,
+            std::min(2000.0, 0.2 * (double)niter));
+          unsigned int _seHeat = _sePre + (unsigned int)(0.1 * (double)niter);
+          double _seGain = scoreSaGain(kiter, _sePre, 1e-4, 0.8, _seHeat);
+          if (_seGain > pas(kiter)) _seGain = pas(kiter);
+          if (scoreSaEtaDistStep(scoreSaEtaDist, evA, evB, famP, fam,
+                                 aP, aK, rhoUse, _seGain, scoreSaRidge,
+                                 _seGain < 1.0, scoreSaBox)) {
+            for (int i = 0; i < naP; ++i) etaDistArgs(jP, i) = aP[i];
+            for (int i = 0; i < na; ++i) etaDistArgs(k, i) = aK[i];
+            etaDistRho(k) = rhoUse;
+            moved = true;
+          }
+        }
+        continue;                       // the score step owns this pair
+      }
       if (!mleOk) continue;
       // etaDistDebug >= 2 observes without acting: the trace above then shows
       // what the M-step WOULD have seen over an otherwise ordinary fit, which
@@ -6105,7 +6200,7 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
       // stochastic-approximation damping, as every other M-step here does
       for (int i = 0; i < na; ++i) {
         double cur = etaDistArgs(k, i);
-        double v = cur + pas(kiter) * (aNew[i] - cur);
+        double v = cur + etaDistGain(kiter, pas) * (aNew[i] - cur);
         if (std::isfinite(v)) { etaDistArgs(k, i) = v; moved = true; }
       }
     }
@@ -6129,7 +6224,7 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
       if (!std::isfinite(r)) continue;
       if (etaDistDebug > 1) continue;
       double cur = etaDistRho(k);
-      double v = cur + pas(kiter) * (r - cur);
+      double v = cur + etaDistGain(kiter, pas) * (r - cur);
       if (std::isfinite(v)) { etaDistRho(k) = v; moved = true; }
     }
     return moved;
