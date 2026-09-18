@@ -7006,6 +7006,7 @@ private:
   // conditional-mean score, whose outer product is the observed information
   // rather than the complete-data one.
   arma::mat etaDistQ2Delta;
+  std::vector<double> etaDistQ2Avg; int etaDistQ2AvgN = 0;   // NONMEM 1.152 average
   arma::mat etaDistQ2Info;     // delta' delta at the last firing
   // line-search engagement, so a hybrid-vs-argmax table can say whether the
   // NONMEM step ever had to act: firings, firings with alpha < 1, the
@@ -8572,7 +8573,22 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     // score-SA's preconditioner: the outer product of the SA-accumulated
     // per-subject scores (NONMEM eq. 1.51 with the accumulation of 1.153;
     // Delattre & Kuhn).  Reported as the information estimate too.
-    arma::mat Hfisher = etaDistQ2Delta.t() * etaDistQ2Delta;
+    // NLMIXR2_Q2_FRESH_H: NONMEM's form -- this iteration's outer product of
+    // the per-SUBJECT conditional-mean score (1.49), i.e. scores averaged over
+    // the nmc chains of each subject before the product (1.51)
+    arma::mat Hfisher;
+    if (getenv("NLMIXR2_Q2_FRESH_H") != NULL && N > 0) {
+      arma::mat gSubj((unsigned int)N, (unsigned int)nth, arma::fill::zeros);
+      arma::vec cnt((unsigned int)N, arma::fill::zeros);
+      for (int r = 0; r < nRec; ++r) {
+        unsigned int sj = (unsigned int)(r % N);
+        gSubj.row(sj) += scores.row((unsigned int)r); cnt(sj) += 1.0;
+      }
+      for (unsigned int sj = 0; sj < (unsigned int)N; ++sj) if (cnt(sj) > 0) gSubj.row(sj) /= cnt(sj);
+      Hfisher = gSubj.t() * gSubj;
+    } else {
+      Hfisher = etaDistQ2Delta.t() * etaDistQ2Delta;
+    }
     Hfisher = 0.5 * (Hfisher + Hfisher.t());
     etaDistQ2Info = Hfisher;
     arma::mat H = Hfisher;
@@ -8599,7 +8615,9 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     }
     double tr = arma::trace(H) / (double)nth;
     if (!(tr > 0.0) || !std::isfinite(tr)) { gEdN1Bad = 1; return; }
-    H.diag() += etaDistQ2Ridge * tr;
+    double ridgeUse = etaDistQ2Ridge;
+    if (getenv("NLMIXR2_Q2_RIDGE") != NULL) ridgeUse = atof(getenv("NLMIXR2_Q2_RIDGE"));
+    H.diag() += ridgeUse * tr;
     arma::vec d;
     if (!arma::solve(d, H, g, arma::solve_opts::likely_sympd) || !d.is_finite()) {
       gEdN1Bad = 1; return;
@@ -8739,6 +8757,7 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     for (int t = 0; t < nUni; ++t) st[(size_t)t] = mprior_phi0(0, col[(size_t)t]);
     st[(size_t)rhoIdx] = std::atanh(rho0);
     bool moved = false;
+    const bool polyak = getenv("NLMIXR2_Q2_POLYAK") != NULL && etaDistQ2Rule != 0;
     double f0 = gEdObj(st.data());
     const std::vector<double> st0(st);   // n1qn1 optimizes st in place
     if (f0 < 1e299) {
@@ -8784,14 +8803,14 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
           if (!std::isfinite(xv)) continue;
           int c = col[(size_t)t];
           double cur = mprior_phi0(0, c);
-          double v = cur + pas(kiter) * (xv - cur);
+          double v = cur + (polyak ? 1.0 : pas(kiter)) * (xv - cur);
           if (std::isfinite(v)) { mprior_phi0.col(c).fill(v); moved = true; }
         }
         // rho, damped on the atanh scale like every other coordinate
         double an = gEdBestPar[(size_t)rhoIdx];
         if (std::isfinite(an)) {
           double a0 = std::atanh(rho0);
-          double av = a0 + pas(kiter) * (an - a0);
+          double av = a0 + (polyak ? 1.0 : pas(kiter)) * (an - a0);
           double rv = std::tanh(av);
           if (std::isfinite(rv)) {
             if (rv > 0.99) rv = 0.99; else if (rv < -0.99) rv = -0.99;
@@ -8825,6 +8844,25 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
         if ((int)etaDistFiredK.size() == etaDistNdist) {
           etaDistFiredK[(size_t)k] = 1; etaDistFiredK[(size_t)j] = 1;
         }
+      }
+    }
+    if (polyak && kiter >= (unsigned int)nb_sa) {
+      // average the EM-phase iterates (thetas and atanh rho); install at the end
+      std::vector<double> now((size_t)nth);
+      for (int t = 0; t < nUni; ++t) now[(size_t)t] = mprior_phi0(0, col[(size_t)t]);
+      double rNow = ((int)etaDistRho.n_elem == etaDistNdist) ? etaDistRho(k) : rho0;
+      now[(size_t)rhoIdx] = std::atanh(std::max(std::min(rNow, 0.99), -0.99));
+      if (etaDistQ2Avg.size() != (size_t)nth) { etaDistQ2Avg = now; etaDistQ2AvgN = 1; }
+      else { etaDistQ2AvgN++; for (int t = 0; t < nth; ++t)
+        etaDistQ2Avg[(size_t)t] += (now[(size_t)t] - etaDistQ2Avg[(size_t)t]) / etaDistQ2AvgN; }
+      if (kiter + 1 >= (unsigned int)niter) {
+        for (int t = 0; t < nUni; ++t) mprior_phi0.col(col[(size_t)t]).fill(etaDistQ2Avg[(size_t)t]);
+        double rv = std::tanh(etaDistQ2Avg[(size_t)rhoIdx]);
+        if ((int)etaDistRho.n_elem == etaDistNdist) { etaDistRho(k) = rv; if (j >= 0 && j < etaDistNdist) etaDistRho(j) = rv; }
+        int cc = corCol(k);
+        if (cc >= 0 && cc < nphi0) mprior_phi0.col(cc).fill(std::atanh(rv));
+        std::vector<int> ix(col); if (cc >= 0 && cc < nphi0) ix.push_back(cc);
+        writeBackPhi0(ix);
       }
     }
     gEdRpn = NULL; gEdRpn2 = NULL; gEdEta = NULL; gEdEta2 = NULL; gEdWt = NULL;
