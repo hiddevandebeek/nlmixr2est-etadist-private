@@ -8548,6 +8548,10 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
       for (int t = 0; t < nth; ++t) cand[(size_t)t] = st[(size_t)t] + alpha * d((unsigned int)t);
       double f = gEdObj(cand.data());
       gEdN1Evals++;
+      if (getenv("NLMIXR2_ETADIST_OPT") != NULL) {
+        RSprintf("[q2score] it=%d try=%d alpha=%.4f f0=%.4f f=%.4f |d|=%.3g\n",
+                 (int)kiter, h, alpha, f0, f, arma::norm(d));
+      }
       if (f < f0 || !lineSearch) {
         if (f < 1e299 && std::isfinite(f)) {
           gEdBest = f; gEdBestPar.assign(cand.begin(), cand.end());
