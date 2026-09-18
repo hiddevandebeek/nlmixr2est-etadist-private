@@ -3820,6 +3820,8 @@ public:
     if (!std::isfinite(iacceptSingle) || iacceptSingle < 0.0 || iacceptSingle >= 1.0) iacceptSingle = 0.0;
     if (x.containsElementNamed("etaDistOn")) etaDistOn = as<int>(x["etaDistOn"]);
     if (x.containsElementNamed("etaDistCorOn")) etaDistCorOn = as<int>(x["etaDistCorOn"]);
+    if (x.containsElementNamed("etaDistQ2Rule")) etaDistQ2Rule = as<int>(x["etaDistQ2Rule"]);
+    if (x.containsElementNamed("etaDistQ2Ridge")) etaDistQ2Ridge = as<double>(x["etaDistQ2Ridge"]);
     if (x.containsElementNamed("etaDistDebug")) etaDistDebug = as<int>(x["etaDistDebug"]);
     if (x.containsElementNamed("etaDistStart")) etaDistStart = as<int>(x["etaDistStart"]);
     if (x.containsElementNamed("etaDistEvery")) etaDistEvery = as<int>(x["etaDistEvery"]);
@@ -6964,6 +6966,18 @@ private:
   // construction.  Damped like every other M-step here, and the damped value is
   // what the refinement then warm-starts from.
   int etaDistCorOn = 0;
+  // saemControl(etaDistQ2Rule=): how the pair step moves the declared thetas
+  // from the current eta sample.  0 argmax (n1qn1 to convergence, accept on
+  // improvement), 1 hybrid (one Fisher-preconditioned score step with NONMEM's
+  // alpha line search, technical guide eqs. 1.47-1.52), 2 score (the same step
+  // with the line search off).  All three share the sample, the objective and
+  // the pas(kiter) damping.
+  int etaDistQ2Rule = 0;
+  double etaDistQ2Ridge = 1e-3;
+  // SA-accumulated per-subject scores (eq. 1.153), one row per record: the
+  // conditional-mean score, whose outer product is the observed information
+  // rather than the complete-data one.
+  arma::mat etaDistQ2Delta;
   // getOption("nlmixr2.etaDistDebug"): 0 off; 1 traces the M-step (the first two
   // iterations and every tenth thereafter) while it acts; 2 traces the same but
   // does NOT apply the update, so the trajectory shown is an ordinary fit's,
@@ -8474,6 +8488,77 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
   // took `nSym`/`rec` per record -- only this caller declined to fill them,
   // which left a covariate coefficient and the copula estimated by two
   // different owners against two different objectives.
+  // One Fisher-preconditioned score step on the pair objective, from the
+  // sample gEd* already describe: NONMEM's non-mu theta route (technical guide
+  // eqs. 1.47-1.52) with the closed-form eta-scale score in place of the
+  // finite difference through the likelihood.
+  //
+  //   g_r  per-record score of the joint density, in the theta coordinates
+  //        (atanh rho in its slot) -- rxEtaDistPairLoglikGrad with nRec = 1
+  //   g    sum_r g_r                                   (1.50)
+  //   H    sum_r gbar_r gbar_r' + ridge                (1.51, 1.153)
+  //   d    H^-1 g
+  //   alpha from 1, halved by sqrt(2) until the objective improves (the text
+  //   after 1.46); `lineSearch` false takes alpha = 1 regardless.
+  //
+  // gbar_r is the SA-accumulated per-record score.  Against one draw per
+  // record the raw outer product is the COMPLETE-data information, which
+  // overstates curvature by the within-subject posterior spread; accumulating
+  // recovers the conditional mean and so the observed information.
+  //
+  // Leaves the result in gEdBest / gEdBestPar exactly where the n1qn1 route
+  // leaves its own, so the caller's accept-and-damp code is shared.
+  void etaDistQ2ScoreStep(const std::vector<double> &st, int nth, double f0,
+                          unsigned int kiter, bool lineSearch) {
+    const int nRec = gEdNRec;
+    if (nRec < 2 || nth <= 0) return;
+    arma::mat scores((unsigned int)nRec, (unsigned int)nth, arma::fill::zeros);
+    std::vector<double> gr((size_t)nth, 0.0);
+    const double one = 1.0;
+    for (int r = 0; r < nRec; ++r) {
+      double v = 0.0;
+      const double *rec = (gEdNSym > 0) ? gEdRec + (size_t)r * (size_t)gEdNSym : NULL;
+      if (!rxEtaDistPairLoglikGrad(gEdFam, *gEdRpn, gEdFam2, *gEdRpn2, nth, gEdNSym,
+                                   st.data(), rec, gEdEta + r, gEdEta2 + r,
+                                   gEdRho, gEdRhoIdx, &one, 1, &v, gr.data())) {
+        gEdN1Bad = 1; return;
+      }
+      for (int t = 0; t < nth; ++t) scores((unsigned int)r, (unsigned int)t) = gr[(size_t)t];
+    }
+    if (!scores.is_finite()) { gEdN1Bad = 1; return; }
+    // accumulate per-record scores with the same gain as every other statistic
+    double gain = (kiter < pas.n_elem) ? pas(kiter) : 1.0;
+    if (etaDistQ2Delta.n_rows != (unsigned int)nRec ||
+        etaDistQ2Delta.n_cols != (unsigned int)nth) etaDistQ2Delta = scores;
+    else etaDistQ2Delta = (1.0 - gain) * etaDistQ2Delta + gain * scores;
+    arma::vec g = arma::sum(scores, 0).t();
+    arma::mat H = etaDistQ2Delta.t() * etaDistQ2Delta;
+    H = 0.5 * (H + H.t());
+    double tr = arma::trace(H) / (double)nth;
+    if (!(tr > 0.0) || !std::isfinite(tr)) { gEdN1Bad = 1; return; }
+    H.diag() += etaDistQ2Ridge * tr;
+    arma::vec d;
+    if (!arma::solve(d, H, g, arma::solve_opts::likely_sympd) || !d.is_finite()) {
+      gEdN1Bad = 1; return;
+    }
+    std::vector<double> cand((size_t)nth);
+    double alpha = 1.0;
+    const int maxHalve = lineSearch ? 12 : 1;
+    for (int h = 0; h < maxHalve; ++h) {
+      for (int t = 0; t < nth; ++t) cand[(size_t)t] = st[(size_t)t] + alpha * d((unsigned int)t);
+      double f = gEdObj(cand.data());
+      gEdN1Evals++;
+      if (f < f0 || !lineSearch) {
+        if (f < 1e299 && std::isfinite(f)) {
+          gEdBest = f; gEdBestPar.assign(cand.begin(), cand.end());
+        }
+        return;
+      }
+      alpha /= std::sqrt(2.0);
+    }
+    // no alpha improved the objective: leave gEdBest at +Inf and nothing moves
+  }
+
   bool etaDistQ2PairStep(int k, int j, unsigned int kiter, const vec &pas) {
     if (!etaDistDirectOn()) return false;          // eta sample, not a latent
     if (!etaDistAllQ2(k) || !etaDistAllQ2(j)) return false;
@@ -8556,16 +8641,20 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     if (f0 < 1e299) {
       gEdBest = R_PosInf; gEdBestPar.assign(st.begin(), st.end());
       gEdN1Bad = 0; gEdN1Evals = 0;
-      std::vector<double> gg((size_t)nth, 0.0);
-      std::vector<double> zm((size_t)(nth*(nth+13)/2 + 1), 0.0);
-      std::vector<double> var((size_t)nth, 0.1);
-      double fN = 0.0, eps = 1e-8;
-      int nn = nth, mode = 1, niter = 200, nsim = 200, impr = 0,
-        izs = 0, idz = 0; float rzs = 0; double dzs = 0;
-      if (n1qn1_ != NULL) {
-        n1qn1_(gEdN1Cost, &nn, st.data(), &fN, gg.data(), var.data(),
-               &eps, &mode, &niter, &nsim, &impr, zm.data(),
-               &izs, &rzs, &dzs, &idz);
+      if (etaDistQ2Rule == 0) {
+        std::vector<double> gg((size_t)nth, 0.0);
+        std::vector<double> zm((size_t)(nth*(nth+13)/2 + 1), 0.0);
+        std::vector<double> var((size_t)nth, 0.1);
+        double fN = 0.0, eps = 1e-8;
+        int nn = nth, mode = 1, niter = 200, nsim = 200, impr = 0,
+          izs = 0, idz = 0; float rzs = 0; double dzs = 0;
+        if (n1qn1_ != NULL) {
+          n1qn1_(gEdN1Cost, &nn, st.data(), &fN, gg.data(), var.data(),
+                 &eps, &mode, &niter, &nsim, &impr, zm.data(),
+                 &izs, &rzs, &dzs, &idz);
+        }
+      } else {
+        etaDistQ2ScoreStep(st, nth, f0, kiter, etaDistQ2Rule == 1);
       }
       if (!gEdN1Bad && gEdN1Evals > 0 && gEdBest < f0) {
         for (int t = 0; t < nUni; ++t) {

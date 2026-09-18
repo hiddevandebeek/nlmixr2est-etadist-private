@@ -418,6 +418,17 @@
 #'     be driven by the diagonal the way `"observed"` can, and it is exempt from
 #'     the spread guard for that reason.
 #'
+#' @param etaDistQ2Rule How the direct route's pair step moves a declared
+#'   pair's thetas from the current eta sample.  `"argmax"` (default) runs
+#'   n1qn1 on the joint prior to convergence and accepts on improvement;
+#'   `"hybrid"` takes one Fisher-preconditioned score step with NONMEM's
+#'   alpha line search (technical guide eqs. 1.47-1.52); `"score"` takes the
+#'   same step with the line search off.  All three share the sample, the
+#'   objective and the `pas(kiter)` damping.
+#'
+#' @param etaDistQ2Ridge Relative ridge added to the score step's information
+#'   matrix (`"hybrid"`/`"score"` only).
+#'
 #' @param etaDistCorMstep Update a `dist()`-declared Gaussian copula's
 #'   correlation from its closed form -- the sample correlation of the latent
 #'   pair -- instead of leaving it to the general non-mu theta refinement.  On
@@ -998,6 +1009,8 @@ saemControl <- function(seed = 99,
                         etaDistSdTol = 0.10,
                         etaDistCorTrust = 1.5,
                         etaDistCorMstep = TRUE,
+                        etaDistQ2Rule = c("argmax", "hybrid", "score"),
+                        etaDistQ2Ridge = 1e-3,
                         etaDistLoglik = NA,
                         stepsizeRw = 0.4,
                         coefSa = 0.95,
@@ -1274,6 +1287,8 @@ saemControl <- function(seed = 99,
   checkmate::assertIntegerish(nb1B, len=1, lower=1, any.missing=FALSE, .var.name="nb1B")
   checkmate::assertLogical(etaDistMstep, len=1, any.missing=FALSE,
                            .var.name="etaDistMstep")
+  etaDistQ2Rule <- match.arg(etaDistQ2Rule)
+  checkmate::assertNumeric(etaDistQ2Ridge, len=1, lower=0, any.missing=FALSE)
   checkmate::assertLogical(etaDistCorMstep, len=1, any.missing=FALSE,
                            .var.name="etaDistCorMstep")
   checkmate::assertNumeric(stepsizeRw, len=1, lower=0, finite=TRUE,
@@ -1311,6 +1326,8 @@ saemControl <- function(seed = 99,
     etaDistCorMethod = as.integer(etaDistCorMethod),
     etaDistCorTrust = as.numeric(etaDistCorTrust),
     etaDistCorMstep = etaDistCorMstep,
+    etaDistQ2Rule = etaDistQ2Rule,
+    etaDistQ2Ridge = etaDistQ2Ridge,
     rwOmega = rwOmega,
     etaDistLoglik = etaDistLoglik,
     etaDistParam = etaDistParam,
