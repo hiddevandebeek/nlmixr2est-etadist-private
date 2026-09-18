@@ -641,7 +641,7 @@
       .cfg$etaDistCorOn <- 0L
     }
     .cfg$etaDistQ2Rule <- match(rxode2::rxGetControl(ui, "etaDistQ2Rule", "hybrid"),
-                                c("argmax", "hybrid", "score")) - 1L
+                                c("argmax", "hybrid", "score", "newton")) - 1L
     .cfg$etaDistQ2Ridge <- as.numeric(rxode2::rxGetControl(ui, "etaDistQ2Ridge", 1e-3))
     .cfg$nonMuThetaSweeps <- as.integer(rxode2::rxGetControl(ui, "nonMuThetaSweeps", 2L))
     .cfg$nonMuThetaMaxEval <- as.integer(rxode2::rxGetControl(ui, "nonMuThetaMaxEval", 25L))

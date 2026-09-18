@@ -425,7 +425,9 @@
 #'   of the accumulated per-subject scores, alpha from 1 halved by sqrt(2)
 #'   until the sampled objective improves; `"score"` is the same step with the
 #'   line search off; `"argmax"` runs n1qn1 on the joint prior to convergence
-#'   and accepts on improvement.  All three share the sample, the
+#'   and accepts on improvement; `"newton"` takes one exact Newton step
+#'   (finite-difference Hessian of the sampled objective) with the line
+#'   search, as a reference.  All three share the sample, the
 #'   objective and the `pas(kiter)` damping.
 #'
 #' @param etaDistQ2Ridge Relative ridge added to the score step's information
@@ -1011,7 +1013,7 @@ saemControl <- function(seed = 99,
                         etaDistSdTol = 0.10,
                         etaDistCorTrust = 1.5,
                         etaDistCorMstep = TRUE,
-                        etaDistQ2Rule = c("hybrid", "argmax", "score"),
+                        etaDistQ2Rule = c("hybrid", "argmax", "score", "newton"),
                         etaDistQ2Ridge = 1e-3,
                         etaDistLoglik = NA,
                         stepsizeRw = 0.4,

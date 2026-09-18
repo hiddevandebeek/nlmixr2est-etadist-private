@@ -3708,6 +3708,7 @@ public:
   NumericVector get_etaDistQ2Ls() {
     return NumericVector::create(Named("firings") = etaDistQ2LsN,
       Named("shortened") = etaDistQ2LsShort, Named("failed") = etaDistQ2LsFail,
+      Named("hessFallback") = etaDistQ2HessFallback,
       Named("minAlpha") = etaDistQ2LsMinAlpha);
   }
   ivec get_etaDistCorWith(){ return etaDistCorWith; }
@@ -5596,7 +5597,26 @@ public:
       bool skipStochPhi0 = nonMuThetaRegress && (distribution != 4) &&
         (kiter >= (unsigned int)niter_phi0);
       if (!skipStochPhi0) {
+        // A declared theta that is prior-only (Q2) does not enter the
+        // observation likelihood on the direct route, so the pseudo-eta the
+        // sampled-mean update draws for it is a random walk under a Gaussian
+        // pseudo-prior: measured with the pair step disabled, the CL shape
+        // wandered from 2.9 to 7.9 in 200 iterations and only stopped when
+        // this update was switched off at niter/2.  Those columns belong to
+        // the pair step alone, from the first iteration.
+        mat keep = mprior_phi0;
         mprior_phi0=COV0*MCOV0;
+        if (etaDistDirectOn() && etaDistNdist > 0) {
+          for (int k = 0; k < etaDistNdist; ++k) {
+            if (!etaDistAllQ2(k)) continue;
+            for (int t = 0; t < etaDistNth(k); ++t) {
+              int c = etaDistPhi0Col(k, t);
+              if (c >= 0 && c < nphi0) mprior_phi0.col(c) = keep.col(c);
+            }
+            int cc = corCol(k);
+            if (cc >= 0 && cc < nphi0) mprior_phi0.col(cc) = keep.col(cc);
+          }
+        }
       }
       if (_saemPhi1PoolReady && kiter >= (unsigned int)niter_phi0 &&
           (kiter - (unsigned int)niter_phi0) % (unsigned int)phi1ThetaEvery == 0) {
@@ -6975,10 +6995,11 @@ private:
   int etaDistCorOn = 0;
   // saemControl(etaDistQ2Rule=): how the pair step moves the declared thetas
   // from the current eta sample.  0 argmax (n1qn1 to convergence, accept on
-  // improvement), 1 hybrid (one Fisher-preconditioned score step with NONMEM's
-  // alpha line search, technical guide eqs. 1.47-1.52), 2 score (the same step
-  // with the line search off).  All three share the sample, the objective and
-  // the pas(kiter) damping.
+  // improvement), 1 hybrid (one score step preconditioned by the centred
+  // per-subject score covariance, with NONMEM's alpha line search, technical
+  // guide eqs. 1.47-1.52), 2 score (the same step with the line search off),
+  // 3 newton (exact FD Hessian of the sampled objective, with the line
+  // search).  All share the sample, the objective and the pas(kiter) damping.
   int etaDistQ2Rule = 0;
   double etaDistQ2Ridge = 1e-3;
   // SA-accumulated per-subject scores (eq. 1.153), one row per record: the
@@ -6989,7 +7010,7 @@ private:
   // line-search engagement, so a hybrid-vs-argmax table can say whether the
   // NONMEM step ever had to act: firings, firings with alpha < 1, the
   // smallest alpha accepted, firings where no alpha improved (nothing moved)
-  int etaDistQ2LsN = 0, etaDistQ2LsShort = 0, etaDistQ2LsFail = 0;
+  int etaDistQ2LsN = 0, etaDistQ2LsShort = 0, etaDistQ2LsFail = 0, etaDistQ2HessFallback = 0;
   double etaDistQ2LsMinAlpha = 1.0;
   // one-shot check of the information estimate against a central-difference
   // Hessian of the sampled objective, under NLMIXR2_ETADIST_OPT
@@ -8548,9 +8569,34 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
         etaDistQ2Delta.n_cols != (unsigned int)nth) etaDistQ2Delta = scores;
     else etaDistQ2Delta = (1.0 - gain) * etaDistQ2Delta + gain * scores;
     arma::vec g = arma::sum(scores, 0).t();
-    arma::mat H = etaDistQ2Delta.t() * etaDistQ2Delta;
-    H = 0.5 * (H + H.t());
-    etaDistQ2Info = H;
+    // score-SA's preconditioner: the outer product of the SA-accumulated
+    // per-subject scores (NONMEM eq. 1.51 with the accumulation of 1.153;
+    // Delattre & Kuhn).  Reported as the information estimate too.
+    arma::mat Hfisher = etaDistQ2Delta.t() * etaDistQ2Delta;
+    Hfisher = 0.5 * (Hfisher + Hfisher.t());
+    etaDistQ2Info = Hfisher;
+    arma::mat H = Hfisher;
+    if (etaDistQ2Rule == 3) {
+      // reference rule: the central-difference Hessian of the sampled
+      // objective (arithmetic only), falling back to the Fisher form where it
+      // is not positive definite
+      arma::mat Hfd((unsigned int)nth, (unsigned int)nth, arma::fill::zeros);
+      std::vector<double> x(st);
+      for (int a = 0; a < nth; ++a) {
+        double ha = 1e-4 * std::max(1.0, std::fabs(st[(size_t)a]));
+        for (int b = a; b < nth; ++b) {
+          double hb = 1e-4 * std::max(1.0, std::fabs(st[(size_t)b]));
+          x = st; x[(size_t)a] += ha; x[(size_t)b] += hb; double fpp = gEdObj(x.data());
+          x = st; x[(size_t)a] += ha; x[(size_t)b] -= hb; double fpm = gEdObj(x.data());
+          x = st; x[(size_t)a] -= ha; x[(size_t)b] += hb; double fmp = gEdObj(x.data());
+          x = st; x[(size_t)a] -= ha; x[(size_t)b] -= hb; double fmm = gEdObj(x.data());
+          double v = (fpp - fpm - fmp + fmm) / (4.0 * ha * hb);
+          Hfd((unsigned int)a, (unsigned int)b) = v; Hfd((unsigned int)b, (unsigned int)a) = v;
+        }
+      }
+      arma::mat Lchol;
+      if (Hfd.is_finite() && arma::chol(Lchol, Hfd)) H = Hfd; else etaDistQ2HessFallback++;
+    }
     double tr = arma::trace(H) / (double)nth;
     if (!(tr > 0.0) || !std::isfinite(tr)) { gEdN1Bad = 1; return; }
     H.diag() += etaDistQ2Ridge * tr;
@@ -8584,6 +8630,14 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
       for (int a = 0; a < nth; ++a)
         RSprintf("[q2info]   %d  %.4g  %.4g\n", a, H((unsigned int)a, (unsigned int)a),
                  Hfd((unsigned int)a, (unsigned int)a));
+      // the two steps side by side: Fisher (outer product) vs true Newton
+      arma::vec dF, dN; arma::mat Hr = H; Hr.diag() += etaDistQ2Ridge * tr;
+      arma::solve(dF, Hr, g); arma::solve(dN, Hfd, g);   // Hr is now the Hessian used
+      RSprintf("[q2step] |g|=%.4g  fisher step:", arma::norm(g));
+      for (int a = 0; a < nth; ++a) RSprintf(" %+.4f", dF((unsigned int)a));
+      RSprintf("   newton step:");
+      for (int a = 0; a < nth; ++a) RSprintf(" %+.4f", dN((unsigned int)a));
+      RSprintf("\n");
     }
     for (int h = 0; h < maxHalve; ++h) {
       for (int t = 0; t < nth; ++t) cand[(size_t)t] = st[(size_t)t] + alpha * d((unsigned int)t);
@@ -8686,6 +8740,7 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     st[(size_t)rhoIdx] = std::atanh(rho0);
     bool moved = false;
     double f0 = gEdObj(st.data());
+    const std::vector<double> st0(st);   // n1qn1 optimizes st in place
     if (f0 < 1e299) {
       gEdBest = R_PosInf; gEdBestPar.assign(st.begin(), st.end());
       gEdN1Bad = 0; gEdN1Evals = 0;
@@ -8702,8 +8757,27 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
                  &izs, &rzs, &dzs, &idz);
         }
       } else {
-        etaDistQ2ScoreStep(st, nth, f0, kiter, etaDistQ2Rule == 1);
+        etaDistQ2ScoreStep(st, nth, f0, kiter, etaDistQ2Rule != 2);
       }
+      if (getenv("NLMIXR2_ETADIST_MOVE") != NULL && gEdN1Evals > 0) {
+        double m1 = 0, m2 = 0, v1 = 0, v2 = 0;
+        for (int r = 0; r < gEdNRec; ++r) { m1 += gEdEta[r]; m2 += gEdEta2[r]; v1 += gEdEta[r]*gEdEta[r]; v2 += gEdEta2[r]*gEdEta2[r]; }
+        m1 /= gEdNRec; m2 /= gEdNRec; v1 = v1/gEdNRec - m1*m1; v2 = v2/gEdNRec - m2*m2;
+        // gradient at st over the whole sample, the way n1qn1 sees it
+        std::vector<double> gAll((size_t)nth, 0.0); double vAll = 0.0;
+        bool okAll = rxEtaDistPairLoglikGrad(gEdFam, *gEdRpn, gEdFam2, *gEdRpn2, nth, gEdNSym,
+                                             st.data(), gEdRec, gEdEta, gEdEta2, gEdRho, gEdRhoIdx,
+                                             gEdWt, gEdNRec, &vAll, gAll.data());
+        double gn = 0.0; for (int t = 0; t < nth; ++t) gn += gAll[(size_t)t]*gAll[(size_t)t];
+
+        RSprintf("[q2move] it=%d rule=%d ok=%d evals=%d bad=%d best=%.2f gradOk=%d |g|=%.3g eta1=%.3f/%.3f eta2=%.3f/%.3f f0=%.2f", (int)kiter, etaDistQ2Rule,
+                 (int)(!gEdN1Bad && gEdBest < f0), gEdN1Evals, gEdN1Bad, gEdBest, (int)okAll, std::sqrt(gn), m1, std::sqrt(v1), m2, std::sqrt(v2), f0);
+        for (int t = 0; t < nth; ++t)
+          RSprintf(" %.6g", (gEdBest < 1e299 ? gEdBestPar[(size_t)t] : st0[(size_t)t]) - st0[(size_t)t]);
+        RSprintf("\n");
+      }
+      // diagnostic: compute the step but never apply it (theta frozen)
+      if (getenv("NLMIXR2_ETADIST_FREEZE") != NULL) gEdBest = R_PosInf;
       if (!gEdN1Bad && gEdN1Evals > 0 && gEdBest < f0) {
         for (int t = 0; t < nUni; ++t) {
           double xv = gEdBestPar[(size_t)t];
