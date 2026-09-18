@@ -3703,6 +3703,7 @@ public:
   // correlation it never used, and .etaDistWarnCorFrozen() had to say so.
   // Returned alongside `etaDistCorWith` so R knows which pair each one joins.
   vec get_etaDistRho()     { return etaDistRho; }
+  mat get_etaDistQ2Info()  { return etaDistQ2Info; }
   ivec get_etaDistCorWith(){ return etaDistCorWith; }
   mat get_mcmcAccTrace()   { return mcmcAccTrace; }
   mat get_mcmcStuckTrace() { return mcmcStuckTrace; }
@@ -6978,6 +6979,7 @@ private:
   // conditional-mean score, whose outer product is the observed information
   // rather than the complete-data one.
   arma::mat etaDistQ2Delta;
+  arma::mat etaDistQ2Info;     // delta' delta at the last firing
   // getOption("nlmixr2.etaDistDebug"): 0 off; 1 traces the M-step (the first two
   // iterations and every tenth thereafter) while it acts; 2 traces the same but
   // does NOT apply the update, so the trajectory shown is an ordinary fit's,
@@ -8534,6 +8536,7 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     arma::vec g = arma::sum(scores, 0).t();
     arma::mat H = etaDistQ2Delta.t() * etaDistQ2Delta;
     H = 0.5 * (H + H.t());
+    etaDistQ2Info = H;
     double tr = arma::trace(H) / (double)nth;
     if (!(tr > 0.0) || !std::isfinite(tr)) { gEdN1Bad = 1; return; }
     H.diag() += etaDistQ2Ridge * tr;
@@ -11308,6 +11311,7 @@ SEXP saem_fit(SEXP xSEXP) {
     Named("mcmcPhiSd") = saem.get_phiSdTrace(),
     Named("mcmcPhiAcf") = saem.get_phiAcfTrace(),
     Named("etaDistRho") = wrap(saem.get_etaDistRho()),
+    Named("etaDistQ2Info") = wrap(saem.get_etaDistQ2Info()),
     Named("etaDistCorWith") = wrap(saem.get_etaDistCorWith())
   );
   current_saem_state = nullptr;

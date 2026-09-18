@@ -419,11 +419,13 @@
 #'     the spread guard for that reason.
 #'
 #' @param etaDistQ2Rule How the direct route's pair step moves a declared
-#'   pair's thetas from the current eta sample.  `"argmax"` (default) runs
-#'   n1qn1 on the joint prior to convergence and accepts on improvement;
-#'   `"hybrid"` takes one Fisher-preconditioned score step with NONMEM's
-#'   alpha line search (technical guide eqs. 1.47-1.52); `"score"` takes the
-#'   same step with the line search off.  All three share the sample, the
+#'   pair's thetas from the current eta sample.  `"hybrid"` (default) is
+#'   NONMEM's non-mu theta route (technical guide eqs. 1.47-1.52) with the
+#'   closed-form eta-scale score: one step preconditioned by the outer product
+#'   of the accumulated per-subject scores, alpha from 1 halved by sqrt(2)
+#'   until the sampled objective improves; `"score"` is the same step with the
+#'   line search off; `"argmax"` runs n1qn1 on the joint prior to convergence
+#'   and accepts on improvement.  All three share the sample, the
 #'   objective and the `pas(kiter)` damping.
 #'
 #' @param etaDistQ2Ridge Relative ridge added to the score step's information
@@ -1009,7 +1011,7 @@ saemControl <- function(seed = 99,
                         etaDistSdTol = 0.10,
                         etaDistCorTrust = 1.5,
                         etaDistCorMstep = TRUE,
-                        etaDistQ2Rule = c("argmax", "hybrid", "score"),
+                        etaDistQ2Rule = c("hybrid", "argmax", "score"),
                         etaDistQ2Ridge = 1e-3,
                         etaDistLoglik = NA,
                         stepsizeRw = 0.4,

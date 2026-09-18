@@ -640,7 +640,7 @@
     } else {
       .cfg$etaDistCorOn <- 0L
     }
-    .cfg$etaDistQ2Rule <- match(rxode2::rxGetControl(ui, "etaDistQ2Rule", "argmax"),
+    .cfg$etaDistQ2Rule <- match(rxode2::rxGetControl(ui, "etaDistQ2Rule", "hybrid"),
                                 c("argmax", "hybrid", "score")) - 1L
     .cfg$etaDistQ2Ridge <- as.numeric(rxode2::rxGetControl(ui, "etaDistQ2Ridge", 1e-3))
     .cfg$nonMuThetaSweeps <- as.integer(rxode2::rxGetControl(ui, "nonMuThetaSweeps", 2L))
@@ -1003,6 +1003,11 @@
   ## read.
   if (!is.null(.saem$etaDistRho)) {
     assign(".etaDistRhoFit", as.numeric(.saem$etaDistRho), envir = env)
+    ## the accumulated score information of the pair step (NONMEM eq. 1.153),
+    ## the by-product a standard error can be built from
+    if (!is.null(.saem$etaDistQ2Info)) {
+      assign(".etaDistQ2InfoFit", .saem$etaDistQ2Info, envir = env)
+    }
     assign(".etaDistCorWithFit",
            if (is.null(.saem$etaDistCorWith)) integer(0)
            else as.integer(.saem$etaDistCorWith), envir = env)
