@@ -97,18 +97,27 @@ rho 0.05, 300 + 200 iterations, `nmc = 1`, one seed, scored against the
 observed-data MLE by adaptive Gauss-Hermite quadrature (q16 and q24 agree to 4
 digits):
 
-| | shV | rtV | shCL | rtCL | rho | fit time |
+| | shV | rtV | shCL | rtCL | rho | max rel. err |
 |---|---|---|---|---|---|---|
 | MLE (AGQ) | 6.785 | 0.3331 | 2.877 | 0.8075 | 0.528 | -- |
-| `argmax` | 6.845 | 0.3346 | 2.869 | 0.8015 | 0.532 | 46 s |
-| `hybrid` | 6.803 | 0.3331 | 2.875 | 0.8048 | 0.529 | 28 s |
-| `newton` | 6.77 | 0.332 | 2.87 | -- | -- | -- |
+| `argmax` (yours) | 6.836 | 0.3350 | 2.889 | 0.8097 | 0.529 | 0.8% |
+| `hybrid` | 6.803 | 0.3331 | 2.875 | 0.8048 | 0.529 | 0.3% |
+| `score` | 6.803 | 0.3331 | 2.875 | 0.8048 | 0.529 | 0.3% |
+| NONMEM-form H (fresh per-subject outer product) | 6.807 | 0.3333 | 2.878 | 0.8056 | 0.530 | 0.3% |
+| NONMEM-form averaging (full step, Polyak) | 6.757 | 0.3303 | 2.862 | 0.8000 | 0.528 | 0.9% |
+| both NONMEM forms | 6.774 | 0.3311 | 2.866 | 0.8011 | 0.527 | 0.8% |
+| ridge 0 / 0.1 | 6.858 / 6.778 | 0.3368 / 0.3324 | 2.882 / 2.873 | 0.8086 / 0.8046 | 0.528 / 0.532 | 1.1% / 0.7% |
 
-Run to 1100 iterations all three sit within 0.02 of the MLE on every parameter.
-NONMEM-form variants of the step (fresh per-subject outer product; full step
-with Polyak averaging; `NLMIXR2_Q2_FRESH_H`, `NLMIXR2_Q2_POLYAK`) all land
-within 1% of the MLE on this dataset.  The line search fired once in ~550
-firings (alpha 0.71); from this start it is a safeguard, not an estimator.
+Wall-clock, measured without contention: `argmax` 46 s, `hybrid` 28 s for the
+500 iterations.  Run to 1100 iterations all rules sit within 0.02 of the MLE
+on every parameter.
+
+Read critically: from this start nothing separates the variants -- every one
+is within ~1% of the MLE and the spread between them is one seed's Monte Carlo
+noise, so this table says none is broken, not which is best.  The line search
+fired zero times in every variant here (once in ~550 firings on another
+dataset, alpha 0.71): from a good start it is a safeguard, not an estimator.
+`score` and `hybrid` are therefore identical here by construction.
 
 Replicates (rho in {0, 0.3, 0.6, 0.85}, five datasets each, all three rules,
 gold per dataset) are running; the table will replace this section.  Until
