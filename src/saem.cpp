@@ -3704,6 +3704,12 @@ public:
   // Returned alongside `etaDistCorWith` so R knows which pair each one joins.
   vec get_etaDistRho()     { return etaDistRho; }
   mat get_etaDistQ2Info()  { return etaDistQ2Info; }
+  mat get_etaDistQ2FdHess() { return etaDistQ2FdHess; }
+  NumericVector get_etaDistQ2Ls() {
+    return NumericVector::create(Named("firings") = etaDistQ2LsN,
+      Named("shortened") = etaDistQ2LsShort, Named("failed") = etaDistQ2LsFail,
+      Named("minAlpha") = etaDistQ2LsMinAlpha);
+  }
   ivec get_etaDistCorWith(){ return etaDistCorWith; }
   mat get_mcmcAccTrace()   { return mcmcAccTrace; }
   mat get_mcmcStuckTrace() { return mcmcStuckTrace; }
@@ -6980,6 +6986,14 @@ private:
   // rather than the complete-data one.
   arma::mat etaDistQ2Delta;
   arma::mat etaDistQ2Info;     // delta' delta at the last firing
+  // line-search engagement, so a hybrid-vs-argmax table can say whether the
+  // NONMEM step ever had to act: firings, firings with alpha < 1, the
+  // smallest alpha accepted, firings where no alpha improved (nothing moved)
+  int etaDistQ2LsN = 0, etaDistQ2LsShort = 0, etaDistQ2LsFail = 0;
+  double etaDistQ2LsMinAlpha = 1.0;
+  // one-shot check of the information estimate against a central-difference
+  // Hessian of the sampled objective, under NLMIXR2_ETADIST_OPT
+  arma::mat etaDistQ2FdHess;
   // getOption("nlmixr2.etaDistDebug"): 0 off; 1 traces the M-step (the first two
   // iterations and every tenth thereafter) while it acts; 2 traces the same but
   // does NOT apply the update, so the trajectory shown is an ordinary fit's,
@@ -8547,6 +8561,30 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     std::vector<double> cand((size_t)nth);
     double alpha = 1.0;
     const int maxHalve = lineSearch ? 12 : 1;
+    etaDistQ2LsN++;
+    if (getenv("NLMIXR2_ETADIST_OPT") != NULL && kiter + 1 >= pas.n_elem) {
+      // FD Hessian of the objective (which is -loglik) at st, for one
+      // comparison against delta'delta
+      arma::mat Hfd((unsigned int)nth, (unsigned int)nth, arma::fill::zeros);
+      std::vector<double> x(st);
+      for (int a = 0; a < nth; ++a) {
+        double ha = 1e-4 * std::max(1.0, std::fabs(st[(size_t)a]));
+        for (int b = a; b < nth; ++b) {
+          double hb = 1e-4 * std::max(1.0, std::fabs(st[(size_t)b]));
+          x = st; x[(size_t)a] += ha; x[(size_t)b] += hb; double fpp = gEdObj(x.data());
+          x = st; x[(size_t)a] += ha; x[(size_t)b] -= hb; double fpm = gEdObj(x.data());
+          x = st; x[(size_t)a] -= ha; x[(size_t)b] += hb; double fmp = gEdObj(x.data());
+          x = st; x[(size_t)a] -= ha; x[(size_t)b] -= hb; double fmm = gEdObj(x.data());
+          double v = (fpp - fpm - fmp + fmm) / (4.0 * ha * hb);
+          Hfd((unsigned int)a, (unsigned int)b) = v; Hfd((unsigned int)b, (unsigned int)a) = v;
+        }
+      }
+      etaDistQ2FdHess = Hfd;
+      RSprintf("[q2info] it=%d  diag(delta'delta) vs diag(FD Hessian of -loglik):\n", (int)kiter);
+      for (int a = 0; a < nth; ++a)
+        RSprintf("[q2info]   %d  %.4g  %.4g\n", a, H((unsigned int)a, (unsigned int)a),
+                 Hfd((unsigned int)a, (unsigned int)a));
+    }
     for (int h = 0; h < maxHalve; ++h) {
       for (int t = 0; t < nth; ++t) cand[(size_t)t] = st[(size_t)t] + alpha * d((unsigned int)t);
       double f = gEdObj(cand.data());
@@ -8559,11 +8597,14 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
         if (f < 1e299 && std::isfinite(f)) {
           gEdBest = f; gEdBestPar.assign(cand.begin(), cand.end());
         }
+        if (h > 0) etaDistQ2LsShort++;
+        if (alpha < etaDistQ2LsMinAlpha) etaDistQ2LsMinAlpha = alpha;
         return;
       }
       alpha /= std::sqrt(2.0);
     }
     // no alpha improved the objective: leave gEdBest at +Inf and nothing moves
+    etaDistQ2LsFail++;
   }
 
   bool etaDistQ2PairStep(int k, int j, unsigned int kiter, const vec &pas) {
@@ -11312,6 +11353,8 @@ SEXP saem_fit(SEXP xSEXP) {
     Named("mcmcPhiAcf") = saem.get_phiAcfTrace(),
     Named("etaDistRho") = wrap(saem.get_etaDistRho()),
     Named("etaDistQ2Info") = wrap(saem.get_etaDistQ2Info()),
+    Named("etaDistQ2FdHess") = wrap(saem.get_etaDistQ2FdHess()),
+    Named("etaDistQ2Ls") = saem.get_etaDistQ2Ls(),
     Named("etaDistCorWith") = wrap(saem.get_etaDistCorWith())
   );
   current_saem_state = nullptr;

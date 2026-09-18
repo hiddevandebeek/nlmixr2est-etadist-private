@@ -1008,6 +1008,10 @@
     if (!is.null(.saem$etaDistQ2Info)) {
       assign(".etaDistQ2InfoFit", .saem$etaDistQ2Info, envir = env)
     }
+    if (!is.null(.saem$etaDistQ2Ls)) {
+      assign(".etaDistQ2LsFit", .saem$etaDistQ2Ls, envir = env)
+      assign(".etaDistQ2FdHessFit", .saem$etaDistQ2FdHess, envir = env)
+    }
     assign(".etaDistCorWithFit",
            if (is.null(.saem$etaDistCorWith)) integer(0)
            else as.integer(.saem$etaDistCorWith), envir = env)
