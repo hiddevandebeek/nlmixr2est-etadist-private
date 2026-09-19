@@ -427,7 +427,12 @@
 #'   line search off; `"argmax"` runs n1qn1 on the joint prior to convergence
 #'   and accepts on improvement; `"newton"` takes one exact Newton step
 #'   (finite-difference Hessian of the sampled objective) with the line
-#'   search, as a reference.  All three share the sample, the
+#'   search, as a reference; `"nonmem"` follows the NONMEM 7 Technical Guide's
+#'   non-mu theta route (eqs. 1.47-1.52) as far as the direct route allows:
+#'   per-subject scores averaged over the `nmc` chains, the information from
+#'   the current iteration only, the alpha search, and `pas(kiter)` damping
+#'   (eq. 1.152's average when the E-step samples at the average).  Meaningful
+#'   with `nmc >= 2`; NONMEM's SAEM default is `ISAMPLE = 2`.  All three share the sample, the
 #'   objective and the `pas(kiter)` damping.
 #'
 #' @param etaDistQ2Ridge Relative ridge added to the score step's information
@@ -1013,7 +1018,7 @@ saemControl <- function(seed = 99,
                         etaDistSdTol = 0.10,
                         etaDistCorTrust = 1.5,
                         etaDistCorMstep = TRUE,
-                        etaDistQ2Rule = c("hybrid", "argmax", "score", "newton"),
+                        etaDistQ2Rule = c("hybrid", "argmax", "score", "newton", "nonmem"),
                         etaDistQ2Ridge = 1e-3,
                         etaDistLoglik = NA,
                         stepsizeRw = 0.4,

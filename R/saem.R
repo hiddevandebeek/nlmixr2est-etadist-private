@@ -641,7 +641,7 @@
       .cfg$etaDistCorOn <- 0L
     }
     .cfg$etaDistQ2Rule <- match(rxode2::rxGetControl(ui, "etaDistQ2Rule", "hybrid"),
-                                c("argmax", "hybrid", "score", "newton")) - 1L
+                                c("argmax", "hybrid", "score", "newton", "nonmem")) - 1L
     .cfg$etaDistQ2Ridge <- as.numeric(rxode2::rxGetControl(ui, "etaDistQ2Ridge", 1e-3))
     .cfg$nonMuThetaSweeps <- as.integer(rxode2::rxGetControl(ui, "nonMuThetaSweeps", 2L))
     .cfg$nonMuThetaMaxEval <- as.integer(rxode2::rxGetControl(ui, "nonMuThetaMaxEval", 25L))
@@ -1007,6 +1007,7 @@
     ## the by-product a standard error can be built from
     if (!is.null(.saem$etaDistQ2Info)) {
       assign(".etaDistQ2InfoFit", .saem$etaDistQ2Info, envir = env)
+      assign(".etaDistQ2GradAccFit", .saem$etaDistQ2GradAcc, envir = env)
     }
     if (!is.null(.saem$etaDistQ2Ls)) {
       assign(".etaDistQ2LsFit", .saem$etaDistQ2Ls, envir = env)

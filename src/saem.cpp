@@ -3704,6 +3704,7 @@ public:
   // Returned alongside `etaDistCorWith` so R knows which pair each one joins.
   vec get_etaDistRho()     { return etaDistRho; }
   mat get_etaDistQ2Info()  { return etaDistQ2Info; }
+  vec get_etaDistQ2GradAcc() { return etaDistQ2GradAcc; }
   mat get_etaDistQ2FdHess() { return etaDistQ2FdHess; }
   NumericVector get_etaDistQ2Ls() {
     return NumericVector::create(Named("firings") = etaDistQ2LsN,
@@ -7000,13 +7001,18 @@ private:
   // per-subject score covariance, with NONMEM's alpha line search, technical
   // guide eqs. 1.47-1.52), 2 score (the same step with the line search off),
   // 3 newton (exact FD Hessian of the sampled objective, with the line
-  // search).  All share the sample, the objective and the pas(kiter) damping.
+  // search), 4 nonmem (technical guide to the letter where the direct route
+  // allows: g_i the conditional MEAN over the subject's nmc chains, H this
+  // iteration's outer product, the alpha search, pas(kiter) -- which is
+  // eq. 1.152's average when the next E-step samples at the average).  All
+  // share the sample, the objective and the pas(kiter) damping.
   int etaDistQ2Rule = 0;
   double etaDistQ2Ridge = 1e-3;
   // SA-accumulated per-subject scores (eq. 1.153), one row per record: the
   // conditional-mean score, whose outer product is the observed information
   // rather than the complete-data one.
   arma::mat etaDistQ2Delta;
+  arma::vec etaDistQ2GradAcc;   // NONMEM eq. 1.153
   std::vector<double> etaDistQ2Avg; int etaDistQ2AvgN = 0;   // NONMEM 1.152 average
   arma::mat etaDistQ2Info;     // delta' delta at the last firing
   // line-search engagement, so a hybrid-vs-argmax table can say whether the
@@ -8578,7 +8584,14 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
     // the per-SUBJECT conditional-mean score (1.49), i.e. scores averaged over
     // the nmc chains of each subject before the product (1.51)
     arma::mat Hfisher;
-    if (getenv("NLMIXR2_Q2_FRESH_H") != NULL && N > 0) {
+    // the accumulated gradient of eq. 1.153, kept for standard errors whatever
+    // the rule (it is what Appendix C uses)
+    if (etaDistQ2Rule == 4 && N > 0) {
+      arma::vec gAcc = arma::sum(scores, 0).t();
+      if (etaDistQ2GradAcc.n_elem != (unsigned int)nth) etaDistQ2GradAcc = gAcc;
+      else etaDistQ2GradAcc = (1.0 - gain) * etaDistQ2GradAcc + gain * gAcc;
+    }
+    if ((etaDistQ2Rule == 4 || getenv("NLMIXR2_Q2_FRESH_H") != NULL) && N > 0) {
       arma::mat gSubj((unsigned int)N, (unsigned int)nth, arma::fill::zeros);
       arma::vec cnt((unsigned int)N, arma::fill::zeros);
       for (int r = 0; r < nRec; ++r) {
@@ -8777,7 +8790,7 @@ int nonMuThetaStart = -1;  // first iteration refinePhi0Lik may run; -1 = niter_
                  &izs, &rzs, &dzs, &idz);
         }
       } else {
-        etaDistQ2ScoreStep(st, nth, f0, kiter, etaDistQ2Rule != 2);
+        etaDistQ2ScoreStep(st, nth, f0, kiter, etaDistQ2Rule != 2);   // line search off only for "score"
       }
       if (getenv("NLMIXR2_ETADIST_MOVE") != NULL && gEdN1Evals > 0) {
         double m1 = 0, m2 = 0, v1 = 0, v2 = 0;
@@ -11466,6 +11479,7 @@ SEXP saem_fit(SEXP xSEXP) {
     Named("mcmcPhiAcf") = saem.get_phiAcfTrace(),
     Named("etaDistRho") = wrap(saem.get_etaDistRho()),
     Named("etaDistQ2Info") = wrap(saem.get_etaDistQ2Info()),
+    Named("etaDistQ2GradAcc") = wrap(saem.get_etaDistQ2GradAcc()),
     Named("etaDistQ2FdHess") = wrap(saem.get_etaDistQ2FdHess()),
     Named("etaDistQ2Ls") = saem.get_etaDistQ2Ls(),
     Named("etaDistCorWith") = wrap(saem.get_etaDistCorWith())
