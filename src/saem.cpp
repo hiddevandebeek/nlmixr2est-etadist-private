@@ -5606,7 +5606,8 @@ public:
         // the pair step alone, from the first iteration.
         mat keep = mprior_phi0;
         mprior_phi0=COV0*MCOV0;
-        if (etaDistDirectOn() && etaDistNdist > 0) {
+        // NLMIXR2_Q2_NOFIX: the branch as shipped, random walk and all
+        if (etaDistDirectOn() && etaDistNdist > 0 && getenv("NLMIXR2_Q2_NOFIX") == NULL) {
           for (int k = 0; k < etaDistNdist; ++k) {
             if (!etaDistAllQ2(k)) continue;
             for (int t = 0; t < etaDistNth(k); ++t) {
